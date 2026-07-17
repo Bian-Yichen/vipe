@@ -16,6 +16,23 @@ ViPE estimates camera intrinsics, camera motion, and dense near-metric depth map
   <a href="https://nv-tlabs.github.io/vipe/dataset/"><img src="https://img.shields.io/badge/Datasets-4B8BBE?logo=databricks&logoColor=white" alt="Datasets"/></a>
 </p>
 
+## Room-tour calibration extension
+
+This branch adds a static-scene pipeline and `vipe-roomtour` command for:
+
+- original-resolution per-frame intrinsics, `K`, OpenCV camera-to-world poses and inverse extrinsics;
+- long-video-safe, chunked RGB-D fusion into colored PLY point clouds;
+- automatic gravity leveling and floor estimation;
+- global RGB/occupancy bird's-eye maps with the full trajectory and a 1 m grid;
+- manual floor segmentation so stair transitions can be excluded and floors solved independently;
+- compact JSON/Markdown QA outputs.
+
+Start with [the room-tour guide](docs/roomtour.md). A complete run is:
+
+```bash
+vipe-roomtour run /data/video.mp4 /data/output/video --pipeline roomtour_dav3
+```
+
 ## News
 
 - **2026/06**: 🚀🚀🚀 Released ViPE 1.2.0: **2.7x speed-up with no loss of accuracy**, enabled by CUDA fused kernels, model and pipeline caching, prefetching, and other optimizations.
@@ -27,4 +44,5 @@ ViPE estimates camera intrinsics, camera motion, and dense near-metric depth map
 
 ## License
 
-This project will download and install additional third-party **models and softwares**. Note that these models or softwares are not distributed by NVIDIA. Review the license terms of these models and projects before use. This source code, **except for the Unik3D part (which is under the BY-NC-SA 4.0 license)** , is released under the [Apache 2 License](https://www.apache.org/licenses/LICENSE-2.0).
+This project will download and install additional third-party **models and softwares**. Note that these models or softwares are not distributed by NVIDIA. Review the license terms of these models and projects before use. This source code, **except for the Unik3D part (which is under the BY-NC-SA 4.0 license)**, is released under the [Apache 2 License](https://www.apache.org/licenses/LICENSE-2.0).
+

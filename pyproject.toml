@@ -7,27 +7,15 @@ target-version = "py310"
 line-length = 120
 
 [tool.ruff.lint]
-select = [
-    "E",
-    "F",
-    "I",
-]
-ignore = [
-    "E501",
-]
+select = ["E", "F", "I"]
+ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
-"__init__.py" = [
-    "F401",
-]
+"__init__.py" = ["F401"]
 
 [tool.mypy]
 python_version = "3.10"
-files = [
-    "run.py",
-    "scripts",
-    "vipe",
-]
+files = ["run.py", "scripts", "vipe", "vipe_roomtour"]
 exclude = [
     "^build/",
     "^vipe\\.egg-info/",
@@ -62,9 +50,7 @@ ignore_missing_imports = true
 name = "nvidia-vipe"
 version = "1.2.0"
 description = "NVIDIA Video Pose Engine"
-authors = [
-    {name = "The ViPE Authors", email = "jiahuih@nvidia.com"},
-]
+authors = [{name = "The ViPE Authors", email = "jiahuih@nvidia.com"}]
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -126,31 +112,24 @@ dev = [
     "ruff>=0.12,<1",
     "twine>=6,<7",
 ]
-docs = [
-    "hydra-core",
-    "mkdocs>=1.6,<2",
-    "omegaconf",
-    "pydantic>=2,<3",
-]
+docs = ["hydra-core", "mkdocs>=1.6,<2", "omegaconf", "pydantic>=2,<3"]
 
 [project.scripts]
 vipe = "vipe.cli.main:main"
+vipe-roomtour = "vipe_roomtour.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["vipe*", "vipe_roomtour*"]
 
 [tool.uv]
 default-groups = []
 
 [tool.uv.extra-build-dependencies]
-nvidia-vipe = [
-    {requirement = "torch", match-runtime = true},
-]
+nvidia-vipe = [{requirement = "torch", match-runtime = true}]
 
 [tool.uv.sources]
-torch = [
-    {index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'"},
-]
-torchvision = [
-    {index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'"},
-]
+torch = [{index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'"}]
+torchvision = [{index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'"}]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

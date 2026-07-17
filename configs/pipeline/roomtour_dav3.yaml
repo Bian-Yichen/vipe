@@ -1,0 +1,16 @@
+defaults:
+  - dav3
+  - _self_
+
+# The user's room-tour set has already been filtered to static scenes.  Turning
+# off TrackAnything avoids its model/runtime cost and prevents masks from
+# accidentally removing legitimate furniture.
+init:
+  camera_type: "pinhole"
+  instance: null
+
+output:
+  save_artifacts: true
+  save_slam_map: true
+  save_viz: false
+

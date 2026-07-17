@@ -1,0 +1,14 @@
+defaults:
+  - default
+  - _self_
+
+# Lighter fallback when Depth Anything 3 is unavailable.
+init:
+  camera_type: "pinhole"
+  instance: null
+
+output:
+  save_artifacts: true
+  save_slam_map: true
+  save_viz: false
+
