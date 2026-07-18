@@ -26,6 +26,7 @@ This branch adds a static-scene pipeline and `vipe-roomtour` command for:
 - global RGB/occupancy bird's-eye maps with the full trajectory and a 1 m grid;
 - manual floor segmentation so stair transitions can be excluded and floors solved independently;
 - compact JSON/Markdown QA outputs.
+- a minimal inference path that does not require Hydra.
 
 Start with [the room-tour guide](docs/roomtour.md). A complete run is:
 
@@ -45,4 +46,3 @@ vipe-roomtour run /data/video.mp4 /data/output/video --pipeline roomtour_dav3
 ## License
 
 This project will download and install additional third-party **models and softwares**. Note that these models or softwares are not distributed by NVIDIA. Review the license terms of these models and projects before use. This source code, **except for the Unik3D part (which is under the BY-NC-SA 4.0 license)**, is released under the [Apache 2 License](https://www.apache.org/licenses/LICENSE-2.0).
-

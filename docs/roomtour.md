@@ -36,8 +36,24 @@ cd vipe
 git checkout agent/roomtour-topdown-map
 
 # Use the same ViPE installation method/environment you normally use.
-# Editable install exposes both `vipe` and `vipe-roomtour`.
+# Editable install exposes both commands. Hydra is not needed by vipe-roomtour.
 python -m pip install -e .
+```
+
+If the environment already contains ViPE's CUDA/model dependencies and only an
+editable command registration is needed, use:
+
+```bash
+python -m pip install -e . --no-deps --no-build-isolation
+```
+
+`vipe-roomtour` now constructs the static pipeline directly with OmegaConf and
+does not import Hydra. Hydra is no longer a default project dependency. The
+original upstream compositional `vipe infer` command is retained for
+compatibility; install Hydra separately only if that command is needed:
+
+```bash
+python -m pip install hydra-core
 ```
 
 ViPE downloads model weights on first use. The `roomtour_dav3` pipeline uses
@@ -120,4 +136,3 @@ frame_ids = data["frame_indices"]
 
 For a camera-space point `p_cam`, `p_world = R_c2w @ p_cam + t_c2w`.
 Camera axes are +x right, +y down, +z forward.
-

@@ -62,7 +62,6 @@ dependencies = [
     "einops",
     "gdown",
     "huggingface_hub",
-    "hydra-core",
     "imageio[ffmpeg]",
     "kornia",
     "matplotlib",

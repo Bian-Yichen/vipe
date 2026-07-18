@@ -23,8 +23,7 @@ def _run_vipe(video: Path, artifact_root: Path, pipeline: str, visualize: bool) 
     command = [
         sys.executable,
         "-m",
-        "vipe.cli.main",
-        "infer",
+        "vipe_roomtour.basic_vipe",
         str(video),
         "--output",
         str(artifact_root),
