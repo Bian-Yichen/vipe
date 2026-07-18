@@ -21,7 +21,6 @@ import imageio
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from pycg import image
 
 from vipe.ext.lietorch import SE3
 from vipe.slam.interface import SLAMOutput
@@ -296,6 +295,17 @@ def save_projection_video(
     subsample_factor: int,
     attributes: list[list[str]],
 ):
+    # PyCG is only needed for the optional diagnostic video.  Keeping this
+    # import local allows core artifact I/O (which reuses VideoWriter) to work
+    # in minimal installations without python-pycg.
+    try:
+        from pycg import image
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Diagnostic visualization requires python-pycg. Install it with "
+            "`python -m pip install python-pycg`, or run without --visualize-vipe."
+        ) from exc
+
     assert isinstance(video_stream, CachedVideoStream)
 
     img_h, img_w = video_stream.frame_size()

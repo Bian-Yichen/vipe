@@ -56,6 +56,11 @@ compatibility; install Hydra separately only if that command is needed:
 python -m pip install hydra-core
 ```
 
+`python-pycg` is also optional for this workflow. It is imported only when
+`--visualize-vipe` is requested; the calibration artifacts, RGB-D fusion, PLY,
+and top-down PNG outputs do not need it. To enable the optional VIPE diagnostic
+video, install it separately with `python -m pip install python-pycg`.
+
 ViPE downloads model weights on first use. The `roomtour_dav3` pipeline uses
 Depth Anything 3 and is the recommended high-quality setting. Review the
 third-party model licenses described by upstream VIPE before large-scale use.
