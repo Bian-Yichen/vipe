@@ -25,6 +25,14 @@ For each full video or manually selected segment, `OUTPUT/maps/NAME/` contains:
 Native VIPE artifacts remain in `OUTPUT/vipe_artifacts/`: RGB, per-frame poses,
 intrinsics, half-float EXR depth zip, diagnostic metadata, and the SLAM map.
 
+The room-tour entry point writes these artifacts with bounded memory.  It does
+not cache every full-resolution RGB-D frame: RGB is encoded during DAv3's
+existing keyframe pre-pass, and each final full-resolution DAv3 depth is written
+to the EXR zip as soon as it is produced.  Pose, intrinsics, and the SLAM map
+are checkpointed before dense depth, allowing a failed post-process to resume
+without repeating SLAM.  This changes storage only; SLAM, DAv3 windows,
+overlap blending, depth resolution, and artifact numeric precision are unchanged.
+
 ## Install
 
 The commands below assume Linux, an NVIDIA CUDA GPU, Git, and FFmpeg. From this
@@ -56,10 +64,9 @@ compatibility; install Hydra separately only if that command is needed:
 python -m pip install hydra-core
 ```
 
-`python-pycg` is also optional for this workflow. It is imported only when
-`--visualize-vipe` is requested; the calibration artifacts, RGB-D fusion, PLY,
-and top-down PNG outputs do not need it. To enable the optional VIPE diagnostic
-video, install it separately with `python -m pip install python-pycg`.
+`python-pycg` is also optional for this workflow. The bounded-memory room-tour
+path does not build ViPE's legacy diagnostic video; use the exported PLY and
+top-down PNG files for QA instead.
 
 ViPE downloads model weights on first use. The `roomtour_dav3` pipeline uses
 Depth Anything 3 and is the recommended high-quality setting. Review the
@@ -80,7 +87,9 @@ values.
 
 For long videos, start with the defaults (`--frame-step 5 --pixel-stride 4`).
 For a denser map, try `--frame-step 2 --pixel-stride 2`; memory and runtime rise
-substantially. `--visualize-vipe` also emits VIPE's diagnostic video.
+substantially. `--visualize-vipe` is intentionally skipped by this bounded-memory
+path because retaining its full RGB-D input would reintroduce length-dependent
+memory use.
 
 ## Run the uploaded example as separate floors
 

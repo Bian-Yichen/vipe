@@ -75,8 +75,13 @@ def run_roomtour(
     for name, video_path, source_offset in jobs:
         artifact = ArtifactSet(artifact_root, name)
         if not skip_inference:
-            if artifact.pose.exists():
-                logger.info("Artifacts already exist for %s; skipping inference", name)
+            try:
+                artifact.validate()
+                artifacts_complete = True
+            except FileNotFoundError:
+                artifacts_complete = False
+            if artifacts_complete:
+                logger.info("Complete artifacts already exist for %s; skipping inference", name)
             else:
                 _run_vipe(video_path, artifact_root, pipeline, visualize_vipe)
         artifact.validate()

@@ -12,10 +12,11 @@ from omegaconf import OmegaConf
 
 
 def build_pipeline(output: Path, pipeline_name: str, save_viz: bool = False):
-    """Construct the stock annotation pipeline without Hydra composition."""
+    """Construct the bounded-memory annotation pipeline without Hydra."""
 
     from vipe import get_config_path
-    from vipe.pipeline.default import DefaultAnnotationPipeline
+
+    from .streaming_vipe import StreamingRoomTourPipeline
 
     presets = {
         "roomtour_dav3": ("dav3", "mvd_dav3"),
@@ -53,7 +54,7 @@ def build_pipeline(output: Path, pipeline_name: str, save_viz: bool = False):
             "viz_attributes": [["rgb", "depth"], ["pcd"]],
         }
     )
-    return DefaultAnnotationPipeline(init=init, slam=slam, post=post, output=output_config)
+    return StreamingRoomTourPipeline(init=init, slam=slam, post=post, output=output_config)
 
 
 def run_inference(video: Path, output: Path, pipeline_name: str, save_viz: bool = False) -> None:
@@ -68,7 +69,9 @@ def run_inference(video: Path, output: Path, pipeline_name: str, save_viz: bool 
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     logger.info("Processing video %s with minimal pipeline %s", video, pipeline_name)
-    stream = ProcessedVideoStream(RawMp4Stream(video), []).cache(desc="Reading video stream")
+    # RawMp4Stream is re-iterable.  Keeping it streaming avoids retaining every
+    # full-resolution float32 RGB frame for the lifetime of a long job.
+    stream = ProcessedVideoStream(RawMp4Stream(video), [])
     build_pipeline(output, pipeline_name, save_viz=save_viz).run(stream)
     logger.info("Finished minimal VIPE inference")
 
@@ -92,4 +95,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

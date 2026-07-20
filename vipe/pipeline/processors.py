@@ -401,7 +401,7 @@ class MultiviewDepthProcessor(StreamProcessor):
         self.secondary_keyframe = secondary_keyframe
 
         self.keyframes_inds = unpack_optional(self.slam_output.slam_map).dense_disp_frame_inds
-        self.keyframes_data: list[VideoFrame] = []
+        self.keyframes_data: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
         self.n_frames = 0
 
         # Need two passes for this iterator to work.
@@ -440,7 +440,9 @@ class MultiviewDepthProcessor(StreamProcessor):
         for frame_idx, frame in enumerate(previous_iterator):
             self.n_frames += 1
             if frame_idx in self.keyframes_inds:
-                self.keyframes_data.append(frame)
+                # Store exactly the uint8 RGB / w2c / K values consumed by
+                # DAv3 instead of retaining a full float32 VideoFrame on GPU.
+                self.keyframes_data.append(frame.dav3_conditions())
             yield frame
 
     def estimate_depth_sliding_window(self, previous_iterator: Iterator[VideoFrame]) -> Iterator[VideoFrame]:
@@ -465,9 +467,7 @@ class MultiviewDepthProcessor(StreamProcessor):
                 sw_images, sw_exts, sw_ints = zip(*[frame.dav3_conditions() for frame in current_sliding_window])
 
                 if len(sw_keyframe_inds) > 0:
-                    kf_images, kf_exts, kf_ints = zip(
-                        *[self.keyframes_data[t].dav3_conditions() for t in sw_keyframe_inds]
-                    )
+                    kf_images, kf_exts, kf_ints = zip(*[self.keyframes_data[t] for t in sw_keyframe_inds])
                 else:
                     kf_images, kf_exts, kf_ints = tuple(), tuple(), tuple()
 
