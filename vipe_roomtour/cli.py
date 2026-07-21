@@ -12,6 +12,7 @@ from pathlib import Path
 import click
 
 from .artifacts import discover_artifacts
+from .chunked import StitchThresholds, run_chunked_roomtour
 from .map_builder import MapOptions, build_map
 from .runner import run_roomtour
 from .segments import parse_segment
@@ -93,6 +94,74 @@ def run_command(
             skip_inference=skip_inference,
             skip_map=skip_map,
             overwrite_segments=overwrite_segments,
+        )
+    except (ValueError, FileNotFoundError, RuntimeError, NotImplementedError, subprocess.CalledProcessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@main.command("chunked-run")
+@click.argument("input_video", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("output_root", type=click.Path(file_okay=False, path_type=Path))
+@click.option("--pipeline", default="roomtour_dav3", show_default=True)
+@click.option(
+    "--chunk-frames",
+    type=click.IntRange(min=100),
+    default=5000,
+    show_default=True,
+    help="Maximum frames in each independently solved chunk, including overlap.",
+)
+@click.option(
+    "--overlap-frames",
+    type=click.IntRange(min=30),
+    default=500,
+    show_default=True,
+    help="Shared source frames used for adjacent Sim(3) alignment.",
+)
+@click.option("--min-stitch-baseline", type=click.FloatRange(min=0.0), default=0.25, show_default=True)
+@click.option("--max-stitch-rmse", type=click.FloatRange(min=0.0), default=0.75, show_default=True)
+@click.option("--max-stitch-rotation-deg", type=click.FloatRange(min=0.0), default=10.0, show_default=True)
+@click.option("--min-stitch-scale", type=click.FloatRange(min=0.001), default=0.5, show_default=True)
+@click.option("--max-stitch-scale", type=click.FloatRange(min=0.001), default=2.0, show_default=True)
+@click.option("--skip-inference", is_flag=True, help="Require and reuse all chunk VIPE artifacts.")
+@click.option("--skip-chunk-maps", is_flag=True, help="Require and reuse chunk maps with identical map options.")
+@_common_map_options
+def chunked_run_command(
+    input_video: Path,
+    output_root: Path,
+    pipeline: str,
+    chunk_frames: int,
+    overlap_frames: int,
+    min_stitch_baseline: float,
+    max_stitch_rmse: float,
+    max_stitch_rotation_deg: float,
+    min_stitch_scale: float,
+    max_stitch_scale: float,
+    skip_inference: bool,
+    skip_chunk_maps: bool,
+    **map_kwargs,
+) -> None:
+    """Solve overlapping chunks independently and stitch them in Sim(3)."""
+
+    try:
+        if min_stitch_scale >= max_stitch_scale:
+            raise ValueError("--max-stitch-scale must be greater than --min-stitch-scale")
+        thresholds = StitchThresholds(
+            min_baseline=min_stitch_baseline,
+            max_position_rmse=max_stitch_rmse,
+            max_rotation_median_deg=max_stitch_rotation_deg,
+            min_scale=min_stitch_scale,
+            max_scale=max_stitch_scale,
+        )
+        run_chunked_roomtour(
+            input_video,
+            output_root,
+            pipeline=pipeline,
+            chunk_frames=chunk_frames,
+            overlap_frames=overlap_frames,
+            map_options=_map_options(**map_kwargs),
+            thresholds=thresholds,
+            skip_inference=skip_inference,
+            skip_chunk_maps=skip_chunk_maps,
         )
     except (ValueError, FileNotFoundError, RuntimeError, NotImplementedError, subprocess.CalledProcessError) as exc:
         raise click.ClickException(str(exc)) from exc

@@ -79,6 +79,55 @@ vipe-roomtour run /data/video.mp4 /data/output/video_001 \
   --pipeline roomtour_dav3
 ```
 
+## Long tours: overlapping chunk solve and Sim(3) stitch
+
+For long trajectories that are less stable as one global SLAM solve, run each
+overlapping block independently and align adjacent blocks through their shared
+source frames:
+
+```bash
+vipe-roomtour chunked-run /data/villa_25000_frames.mp4 /data/output/villa_chunked \
+  --pipeline roomtour_dav3 \
+  --chunk-frames 5000 \
+  --overlap-frames 500
+```
+
+The half-open blocks are `[0,5000)`, `[4500,9500)`, and so on. They are read
+directly from the original MP4; no lossy intermediate clip is created. Every
+block uses the bounded-memory SLAM/DAv3 writer described above.
+
+Adjacent blocks have independent coordinate gauges. The stitcher therefore
+does not concatenate their matrices directly. It uses the matching camera
+centres and orientations in the 500 shared frames to robustly estimate a
+Sim(3): rotation, translation, and scale. The scale is applied to both the
+chunk point cloud and its camera translations. Duplicate poses in the overlap
+are rotation/translation blended so the final per-frame trajectory is smooth.
+
+The extra model work is approximately
+`overlap / (chunk_size - overlap)` (11.1% for 500/5000). Pose-based alignment
+itself is negligible and is safer than unconstrained ICP on repetitive walls.
+The command rejects a stitch if the overlap has too little camera motion, an
+implausible scale ratio, excessive position RMSE, or excessive rotation error.
+Move the boundary or increase overlap rather than disabling those checks.
+
+Important outputs are:
+
+- `OUTPUT/chunks/CHUNK_NAME/`: each independently calibrated chunk map.
+- `OUTPUT/vipe_artifacts/`: each chunk's RGB, depth, pose, intrinsics, and SLAM map.
+- `OUTPUT/global/calibration.npz`: continuous full-video frame indices, intrinsics, and stitched c2w/w2c.
+- `OUTPUT/global/global_rgb_map_world.ply`: all chunk clouds in the chunk-0 world/scale.
+- `OUTPUT/global/topdown_with_trajectory.png`: global stitched QA view.
+- `OUTPUT/global/chunk_transforms.json`: local-to-global Sim(3) and depth scale for every chunk.
+- `OUTPUT/global/stitch_metrics.json`: overlap baseline, scale, position RMSE, and rotation error.
+- `OUTPUT/global/per_frame_chunk_assignment.csv`: primary chunk plus its exact
+  depth-to-global scale (and the overlap-blended scale) for every source frame.
+
+This strategy removes long-horizon drift inside one monolithic solve, but it
+cannot repair a bad pose estimate inside a 5000-frame chunk. Pairwise alignment
+also accumulates slowly over many chunks because there is no distant loop
+closure. It is most suitable when the camera continuously explores new areas,
+as in the intended villa tours.
+
 This accepts any input resolution supported by VIPE (720p, 1080p, and so on).
 VIPE writes intrinsics in the original RGB pixel grid. If dense depth uses a
 different internal grid, the mapper independently scales x/y intrinsics only

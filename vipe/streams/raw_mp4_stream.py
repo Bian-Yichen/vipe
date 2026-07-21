@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from pathlib import Path
 
@@ -22,10 +10,7 @@ from vipe.streams.base import ProcessedVideoStream, StreamList, VideoFrame, Vide
 
 
 class RawMp4Stream(VideoStream):
-    """
-    A video stream from a raw mp4 file, using opencv.
-    This does not support nested iterations.
-    """
+    """Read an MP4, optionally restricted to an exact half-open frame range."""
 
     def __init__(self, path: Path, seek_range: range | None = None, name: str | None = None) -> None:
         super().__init__()
@@ -35,7 +20,6 @@ class RawMp4Stream(VideoStream):
         self.path = path
         self._name = name if name is not None else path.stem
 
-        # Read metadata
         vcap = cv2.VideoCapture(str(self.path))
         self._width = int(vcap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self._height = int(vcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -64,6 +48,17 @@ class RawMp4Stream(VideoStream):
     def __iter__(self):
         self.vcap = cv2.VideoCapture(self.path)
         self.current_frame_idx = -1
+        if self.start > 0:
+            # OpenCV's FFmpeg backend seeks to the requested decoded frame. If
+            # a backend cannot seek or overshoots, fall back to exact sequential
+            # decoding instead of silently shifting a chunk overlap.
+            seek_ok = self.vcap.set(cv2.CAP_PROP_POS_FRAMES, self.start)
+            seek_position = int(round(self.vcap.get(cv2.CAP_PROP_POS_FRAMES)))
+            if seek_ok and seek_position == self.start:
+                self.current_frame_idx = seek_position - 1
+            else:
+                self.vcap.release()
+                self.vcap = cv2.VideoCapture(self.path)
         return self
 
     def __next__(self) -> VideoFrame:

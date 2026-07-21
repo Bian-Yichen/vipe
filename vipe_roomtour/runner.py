@@ -19,7 +19,16 @@ from .segments import Segment, cut_segment
 logger = logging.getLogger(__name__)
 
 
-def _run_vipe(video: Path, artifact_root: Path, pipeline: str, visualize: bool) -> None:
+def _run_vipe(
+    video: Path,
+    artifact_root: Path,
+    pipeline: str,
+    visualize: bool,
+    *,
+    start_frame: int | None = None,
+    end_frame: int | None = None,
+    artifact_name: str | None = None,
+) -> None:
     command = [
         sys.executable,
         "-m",
@@ -32,6 +41,12 @@ def _run_vipe(video: Path, artifact_root: Path, pipeline: str, visualize: bool) 
     ]
     if visualize:
         command.append("--visualize")
+    if start_frame is not None:
+        command.extend(["--start-frame", str(start_frame)])
+    if end_frame is not None:
+        command.extend(["--end-frame", str(end_frame)])
+    if artifact_name is not None:
+        command.extend(["--artifact-name", artifact_name])
     logger.info("Running: %s", " ".join(command))
     subprocess.run(command, check=True)
 

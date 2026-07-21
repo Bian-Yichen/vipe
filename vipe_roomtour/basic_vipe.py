@@ -57,7 +57,16 @@ def build_pipeline(output: Path, pipeline_name: str, save_viz: bool = False):
     return StreamingRoomTourPipeline(init=init, slam=slam, post=post, output=output_config)
 
 
-def run_inference(video: Path, output: Path, pipeline_name: str, save_viz: bool = False) -> None:
+def run_inference(
+    video: Path,
+    output: Path,
+    pipeline_name: str,
+    save_viz: bool = False,
+    *,
+    start_frame: int | None = None,
+    end_frame: int | None = None,
+    artifact_name: str | None = None,
+) -> None:
     """Decode one continuous video and run the minimal static-scene pipeline."""
 
     from vipe.streams.base import ProcessedVideoStream
@@ -69,9 +78,21 @@ def run_inference(video: Path, output: Path, pipeline_name: str, save_viz: bool 
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     logger.info("Processing video %s with minimal pipeline %s", video, pipeline_name)
-    # RawMp4Stream is re-iterable.  Keeping it streaming avoids retaining every
+    seek_range = None
+    if start_frame is not None or end_frame is not None:
+        start = 0 if start_frame is None else int(start_frame)
+        end = -1 if end_frame is None else int(end_frame)
+        if start < 0 or (end != -1 and end <= start):
+            raise ValueError(f"Invalid half-open frame range [{start}, {end})")
+        seek_range = range(start, end)
+        logger.info("Restricting input to source frames [%d, %s)", start, "end" if end == -1 else end)
+
+    # RawMp4Stream is re-iterable. Keeping it streaming avoids retaining every
     # full-resolution float32 RGB frame for the lifetime of a long job.
-    stream = ProcessedVideoStream(RawMp4Stream(video), [])
+    stream = ProcessedVideoStream(
+        RawMp4Stream(video, seek_range=seek_range, name=artifact_name),
+        [],
+    )
     build_pipeline(output, pipeline_name, save_viz=save_viz).run(stream)
     logger.info("Finished minimal VIPE inference")
 
@@ -87,10 +108,21 @@ def main() -> None:
         default="roomtour_dav3",
     )
     parser.add_argument("--visualize", action="store_true", help="Write VIPE's diagnostic video")
+    parser.add_argument("--start-frame", type=int, default=None, help="Inclusive source frame for chunked inference")
+    parser.add_argument("--end-frame", type=int, default=None, help="Exclusive source frame for chunked inference")
+    parser.add_argument("--artifact-name", default=None, help="Override the artifact basename")
     args = parser.parse_args()
     if not args.video.is_file():
         parser.error(f"Video does not exist: {args.video}")
-    run_inference(args.video, args.output, args.pipeline, save_viz=args.visualize)
+    run_inference(
+        args.video,
+        args.output,
+        args.pipeline,
+        save_viz=args.visualize,
+        start_frame=args.start_frame,
+        end_frame=args.end_frame,
+        artifact_name=args.artifact_name,
+    )
 
 
 if __name__ == "__main__":

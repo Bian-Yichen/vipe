@@ -20,6 +20,21 @@ def test_voxel_observations_count_distinct_frames(tmp_path: Path):
     np.testing.assert_allclose(cloud.colors[0], [150, 0, 0], atol=1)
 
 
+def test_aggregated_cloud_support_is_preserved(tmp_path: Path):
+    accumulator = VoxelAccumulator(0.1, tmp_path / "aggregate")
+    accumulator.add_cloud(
+        np.array([[0.01, 0.01, 0.01], [0.02, 0.01, 0.01]]),
+        np.array([[100, 0, 0], [200, 0, 0]]),
+        observations=np.array([3, 5]),
+        samples=np.array([6, 10]),
+    )
+    cloud = accumulator.finalize(min_observations=2)
+    assert cloud.observations.tolist() == [8]
+    assert cloud.samples.tolist() == [16]
+    np.testing.assert_allclose(cloud.points[0], [0.01625, 0.01, 0.01], atol=1e-6)
+    np.testing.assert_allclose(cloud.colors[0], [163, 0, 0], atol=1)
+
+
 def test_topdown_and_ply_are_written(tmp_path: Path):
     x, z = np.meshgrid(np.linspace(-1, 1, 30), np.linspace(-1, 1, 30))
     points = np.column_stack((x.ravel(), np.full(x.size, 1.6), z.ravel()))

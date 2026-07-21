@@ -27,11 +27,19 @@ This branch adds a static-scene pipeline and `vipe-roomtour` command for:
 - manual floor segmentation so stair transitions can be excluded and floors solved independently;
 - compact JSON/Markdown QA outputs.
 - a minimal inference path that does not require Hydra.
+- overlapping 5000-frame SLAM/DAv3 solves with robust Sim(3) stitching for very long tours.
 
 Start with [the room-tour guide](docs/roomtour.md). A complete run is:
 
 ```bash
 vipe-roomtour run /data/video.mp4 /data/output/video --pipeline roomtour_dav3
+```
+
+For a long villa tour whose monolithic SLAM trajectory drifts:
+
+```bash
+vipe-roomtour chunked-run /data/villa.mp4 /data/output/villa \
+  --pipeline roomtour_dav3 --chunk-frames 5000 --overlap-frames 500
 ```
 
 ## News

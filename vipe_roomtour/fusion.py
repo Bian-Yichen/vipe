@@ -86,6 +86,63 @@ class VoxelAccumulator:
         if self._records >= self.max_records:
             self._flush()
 
+    def add_cloud(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray,
+        observations: np.ndarray | None = None,
+        samples: np.ndarray | None = None,
+    ) -> None:
+        """Merge an already-aggregated voxel cloud without expanding samples.
+
+        This is used by chunk stitching: each input PLY is already a fused
+        per-chunk cloud, so its averaged point/color must be weighted by its
+        support before the transformed chunks are voxelized again globally.
+        """
+
+        points = np.asarray(points, dtype=np.float64)
+        colors = np.asarray(colors, dtype=np.float64)
+        if points.shape != colors.shape or points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError("points and colors must both be Nx3")
+        if observations is None:
+            observations = np.ones(len(points), dtype=np.int64)
+        if samples is None:
+            samples = observations
+        observations = np.asarray(observations, dtype=np.int64)
+        samples = np.asarray(samples, dtype=np.int64)
+        if observations.shape != (len(points),) or samples.shape != (len(points),):
+            raise ValueError("observations and samples must have one value per point")
+
+        valid = (
+            np.isfinite(points).all(axis=1)
+            & np.isfinite(colors).all(axis=1)
+            & (observations > 0)
+            & (samples > 0)
+        )
+        points = points[valid]
+        colors = colors[valid]
+        observations = observations[valid]
+        samples = samples[valid]
+        if len(points) == 0:
+            return
+
+        coords = np.floor(points / self.voxel_size).astype(np.int64)
+        reduced = _reduce_records(
+            coords,
+            points * samples[:, None],
+            colors * samples[:, None],
+            samples,
+            observations,
+        )
+        self._coords.append(reduced[0])
+        self._points.append(reduced[1])
+        self._colors.append(reduced[2])
+        self._samples.append(reduced[3])
+        self._observations.append(reduced[4])
+        self._records += len(reduced[0])
+        if self._records >= self.max_records:
+            self._flush()
+
     def _flush(self) -> None:
         if self._records == 0:
             return
