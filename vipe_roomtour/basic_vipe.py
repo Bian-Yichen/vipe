@@ -10,6 +10,8 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
+from .output_paths import resolve_output_path
+
 
 def build_pipeline(output: Path, pipeline_name: str, save_viz: bool = False):
     """Construct the bounded-memory annotation pipeline without Hydra."""
@@ -75,7 +77,7 @@ def run_inference(
 
     logger = configure_logging()
     video = Path(video).resolve()
-    output = Path(output).resolve()
+    output = resolve_output_path(output)
     output.mkdir(parents=True, exist_ok=True)
     logger.info("Processing video %s with minimal pipeline %s", video, pipeline_name)
     seek_range = None

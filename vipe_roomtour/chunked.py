@@ -21,6 +21,7 @@ from .artifacts import ArtifactSet, Calibration, export_calibration, load_calibr
 from .fusion import VoxelAccumulator
 from .geometry import estimate_floor_y, estimate_level_frame, intrinsics_matrix, pose_tilt_degrees
 from .map_builder import MapOptions, build_map, probe_video
+from .output_paths import resolve_output_path
 from .runner import _run_vipe
 from .topdown import render_topdown
 
@@ -544,7 +545,7 @@ def stitch_chunk_results(
             metrics["blended_boundary_rotation_step_deg"] = float(
                 _rotation_angle_degrees(relative_rotation[None])[0]
             )
-    output_dir = Path(output_dir)
+    output_dir = resolve_output_path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     export_calibration(calibration, output_dir, fps=fps, image_wh=image_wh)
     chunk_scales = np.asarray([chunk.transform.scale for chunk in chunks], dtype=np.float64)
@@ -677,7 +678,7 @@ def run_chunked_roomtour(
     skip_chunk_maps: bool = False,
 ) -> dict[str, Any]:
     input_video = Path(input_video).resolve()
-    output_root = Path(output_root).resolve()
+    output_root = resolve_output_path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     video_info = probe_video(input_video)
     total_frames = count_video_frames(input_video)

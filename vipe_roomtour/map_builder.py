@@ -26,6 +26,7 @@ from .geometry import (
     pose_tilt_degrees,
     scale_intrinsics,
 )
+from .output_paths import resolve_output_path
 from .topdown import render_topdown
 
 logger = logging.getLogger(__name__)
@@ -162,7 +163,7 @@ def build_map(
     from vipe.utils.io import read_depth_artifacts, read_rgb_artifacts
 
     artifact.validate()
-    output_dir = Path(output_dir)
+    output_dir = resolve_output_path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     video = probe_video(artifact.rgb)
     calibration = load_calibration(artifact)

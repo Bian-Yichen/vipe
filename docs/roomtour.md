@@ -74,8 +74,12 @@ third-party model licenses described by upstream VIPE before large-scale use.
 
 ## Run one complete video
 
+`OUTPUT` must be an absolute path (or begin with `~/`). Relative outputs such
+as `output` are rejected so results cannot accidentally be written inside the
+current ViPE checkout.
+
 ```bash
-vipe-roomtour run /data/video.mp4 /data/output/video_001 \
+vipe-roomtour run /data/video.mp4 /mnt/petrelfs/user/results/video_001 \
   --pipeline roomtour_dav3
 ```
 
@@ -86,7 +90,7 @@ overlapping block independently and align adjacent blocks through their shared
 source frames:
 
 ```bash
-vipe-roomtour chunked-run /data/villa_25000_frames.mp4 /data/output/villa_chunked \
+vipe-roomtour chunked-run /data/villa_25000_frames.mp4 /mnt/petrelfs/user/results/villa_chunked \
   --pipeline roomtour_dav3 \
   --chunk-frames 5000 \
   --overlap-frames 500
