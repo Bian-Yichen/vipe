@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .artifacts import ArtifactSet
 from .map_builder import MapOptions, build_map
+from .output_paths import resolve_output_path
 from .segments import Segment, cut_segment
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,7 @@ def run_roomtour(
     overwrite_segments: bool = False,
 ) -> dict:
     input_video = Path(input_video).resolve()
-    output_root = Path(output_root).resolve()
+    output_root = resolve_output_path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     artifact_root = output_root / "vipe_artifacts"
     artifact_root.mkdir(parents=True, exist_ok=True)

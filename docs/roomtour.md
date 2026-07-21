@@ -74,6 +74,10 @@ third-party model licenses described by upstream VIPE before large-scale use.
 
 ## Run one complete video
 
+`OUTPUT` must be an absolute path (or begin with `~/`). Relative outputs such
+as `output` are rejected so results cannot accidentally be written inside the
+current ViPE checkout.
+
 ```bash
 vipe-roomtour run /data/video.mp4 /data/output/video_001 \
   --pipeline roomtour_dav3
