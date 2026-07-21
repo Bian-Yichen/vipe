@@ -392,6 +392,14 @@ class MultiviewDepthProcessor(StreamProcessor):
         window_size: int = 10,  # Practically this should be as large as possible if memory permits.
         overlap_size: int = 3,
         secondary_keyframe: bool = False,  # This is found to cause jittering for some scenes due to abrupt context changes.
+        frame_step: int = 1,
+        process_res: int = 504,
+        process_res_method: str = "lower_bound_resize",
+        output_resolution: str = "original",
+        dav3_model: str = "giant",
+        dav3_model_path: str | None = None,
+        inference_start_ordinal: int = 0,
+        emit_start_ordinal: int = 0,
     ):
         super().__init__()
         self.slam_output = slam_output
@@ -399,6 +407,16 @@ class MultiviewDepthProcessor(StreamProcessor):
         self.window_size = window_size
         self.overlap_size = overlap_size
         self.secondary_keyframe = secondary_keyframe
+        self.frame_step = int(frame_step)
+        self.process_res = int(process_res)
+        self.process_res_method = process_res_method
+        self.output_resolution = output_resolution
+        self.inference_start_ordinal = int(inference_start_ordinal)
+        self.emit_start_ordinal = int(emit_start_ordinal)
+        if self.frame_step < 1:
+            raise ValueError("frame_step must be >= 1")
+        if not 0 <= self.inference_start_ordinal <= self.emit_start_ordinal:
+            raise ValueError("Invalid DAv3 resume ordinals")
 
         self.keyframes_inds = unpack_optional(self.slam_output.slam_map).dense_disp_frame_inds
         self.keyframes_data: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None]] = []
@@ -412,7 +430,17 @@ class MultiviewDepthProcessor(StreamProcessor):
             from vipe.priors.depth.dav3.utils import logger as dav3_logger
 
             dav3_logger.level = 0  # Disable logging timing information
-            self.dav3_api = DepthAnything3.from_pretrained("depth-anything/DA3-GIANT", model_name="da3-giant")
+            checkpoints = {
+                "giant": ("depth-anything/DA3-GIANT", "da3-giant"),
+                "large": ("depth-anything/DA3-LARGE", "da3-large"),
+                "base": ("depth-anything/DA3-BASE", "da3-base"),
+                "small": ("depth-anything/DA3-SMALL", "da3-small"),
+            }
+            if dav3_model not in checkpoints:
+                raise ValueError(f"Unsupported DAv3 model: {dav3_model}")
+            checkpoint, model_name = checkpoints[dav3_model]
+            checkpoint = dav3_model_path or checkpoint
+            self.dav3_api = DepthAnything3.from_pretrained(checkpoint, model_name=model_name)
             self.dav3_api = self.dav3_api.cuda().eval()
 
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
@@ -445,61 +473,100 @@ class MultiviewDepthProcessor(StreamProcessor):
                 self.keyframes_data.append(frame.dav3_conditions())
             yield frame
 
+    def _estimate_window(
+        self,
+        current_sliding_window: list[VideoFrame],
+        current_sliding_window_idx: list[int],
+        trailing_depth: torch.Tensor | None,
+        *,
+        is_last_window: bool,
+    ) -> tuple[list[VideoFrame], list[int], torch.Tensor | None, list[tuple[VideoFrame, int]]]:
+        """Infer one unchanged-overlap DAv3 window and return frames ready to emit."""
+
+        sw_keyframe_inds = list(
+            set(sum([self._probe_keyframe_indices(i) for i in current_sliding_window_idx], []))
+        )
+        sw_keyframe_inds = [
+            t for t in sw_keyframe_inds if self.keyframes_inds[t] not in current_sliding_window_idx
+        ]
+        sw_images, sw_exts, sw_ints = zip(*[frame.dav3_conditions() for frame in current_sliding_window])
+        if sw_keyframe_inds:
+            kf_images, kf_exts, kf_ints = zip(*[self.keyframes_data[t] for t in sw_keyframe_inds])
+        else:
+            kf_images, kf_exts, kf_ints = tuple(), tuple(), tuple()
+
+        result = self.dav3_api.inference(
+            list(sw_images + kf_images),
+            extrinsics=np.stack(sw_exts + kf_exts, axis=0),
+            intrinsics=np.stack(sw_ints + kf_ints, axis=0),
+            process_res=self.process_res,
+            process_res_method=self.process_res_method,
+        )
+        sw_depth = torch.from_numpy(result.depth[: len(sw_images)]).float().cuda()
+        if self.output_resolution == "original":
+            sw_depth = torch.nn.functional.interpolate(
+                sw_depth[:, None], current_sliding_window[0].size(), mode="bilinear"
+            )[:, 0]
+
+        n_frames_to_yield = (
+            len(current_sliding_window)
+            if is_last_window
+            else self.window_size - self.overlap_size
+        )
+        if trailing_depth is not None:
+            n_interp_frames = len(trailing_depth)
+            alpha = torch.linspace(0, 1, n_interp_frames + 2, device=sw_depth.device)[1:-1, None, None]
+            sw_depth[:n_interp_frames] = trailing_depth * (1 - alpha) + sw_depth[:n_interp_frames] * alpha
+
+        ready_frames = current_sliding_window[:n_frames_to_yield]
+        ready = list(zip(ready_frames, current_sliding_window_idx[:n_frames_to_yield], strict=True))
+        for sw_idx, (ready_frame, _) in enumerate(ready):
+            ready_frame.metric_depth = sw_depth[sw_idx]
+        return (
+            current_sliding_window[n_frames_to_yield:],
+            current_sliding_window_idx[n_frames_to_yield:],
+            sw_depth[n_frames_to_yield:],
+            ready,
+        )
+
     def estimate_depth_sliding_window(self, previous_iterator: Iterator[VideoFrame]) -> Iterator[VideoFrame]:
         current_sliding_window: list[VideoFrame] = []
         current_sliding_window_idx: list[int] = []
         trailing_depth: torch.Tensor | None = None
+        last_selected_index = ((self.n_frames - 1) // self.frame_step) * self.frame_step
         for frame_idx, frame in pbar(enumerate(previous_iterator), desc="Estimating multi-view depth"):
+            if frame_idx % self.frame_step:
+                continue
+            selected_ordinal = frame_idx // self.frame_step
+            if selected_ordinal < self.inference_start_ordinal:
+                continue
             current_sliding_window.append(frame)
             current_sliding_window_idx.append(frame_idx)
-            is_last_frame = frame_idx == self.n_frames - 1
-
-            if len(current_sliding_window) == self.window_size or is_last_frame:
-                # Grab all neighboring keyframes to anchor the current sliding window.
-                # Note that we remove redundant keyframes that already exist in the current sliding window.
-                sw_keyframe_inds = list(
-                    set(sum([self._probe_keyframe_indices(i) for i in current_sliding_window_idx], []))
+            is_last_selected = frame_idx == last_selected_index
+            if len(current_sliding_window) == self.window_size or is_last_selected:
+                current_sliding_window, current_sliding_window_idx, trailing_depth, ready = self._estimate_window(
+                    current_sliding_window,
+                    current_sliding_window_idx,
+                    trailing_depth,
+                    is_last_window=is_last_selected,
                 )
-                sw_keyframe_inds = [
-                    t for t in sw_keyframe_inds if self.keyframes_inds[t] not in current_sliding_window_idx
-                ]
+                for ready_frame, ready_index in ready:
+                    if ready_index // self.frame_step >= self.emit_start_ordinal:
+                        yield ready_frame
 
-                sw_images, sw_exts, sw_ints = zip(*[frame.dav3_conditions() for frame in current_sliding_window])
-
-                if len(sw_keyframe_inds) > 0:
-                    kf_images, kf_exts, kf_ints = zip(*[self.keyframes_data[t] for t in sw_keyframe_inds])
-                else:
-                    kf_images, kf_exts, kf_ints = tuple(), tuple(), tuple()
-
-                # Perform inference
-                dav3_inference_result = self.dav3_api.inference(
-                    list(sw_images + kf_images),
-                    extrinsics=np.stack(sw_exts + kf_exts, axis=0),
-                    intrinsics=np.stack(sw_ints + kf_ints, axis=0),
-                    process_res_method="lower_bound_resize",  # Keep aspect ratio
-                )
-                sw_depth = torch.from_numpy(dav3_inference_result.depth[: len(sw_images)]).float().cuda()
-                sw_depth = torch.nn.functional.interpolate(sw_depth[:, None], frame.size(), mode="bilinear")[:, 0]
-
-                n_frames_to_yield = (
-                    self.window_size - self.overlap_size if not is_last_frame else len(current_sliding_window)
-                )
-
-                # Linearly interpolate the trailing depth with new depth
-                if trailing_depth is not None:
-                    n_interp_frames = len(trailing_depth)
-                    alpha = torch.linspace(0, 1, n_interp_frames + 2)[1:-1].float().cuda()[:, None, None]
-                    sw_depth[:n_interp_frames] = trailing_depth * (1 - alpha) + sw_depth[:n_interp_frames] * alpha
-
-                for sw_idx, frame in enumerate(current_sliding_window[:n_frames_to_yield]):
-                    frame.metric_depth = sw_depth[sw_idx]
-                    yield frame
-
-                trailing_depth = sw_depth[n_frames_to_yield:]
-                current_sliding_window = current_sliding_window[n_frames_to_yield:]
-                current_sliding_window_idx = current_sliding_window_idx[n_frames_to_yield:]
-
-        assert len(current_sliding_window) == 0, "Current sliding window should be empty"
+        if current_sliding_window:
+            # Defensive fallback for a truncated iterator whose declared length
+            # exceeded the frames actually decoded.
+            current_sliding_window, current_sliding_window_idx, trailing_depth, ready = self._estimate_window(
+                current_sliding_window,
+                current_sliding_window_idx,
+                trailing_depth,
+                is_last_window=True,
+            )
+            for ready_frame, ready_index in ready:
+                if ready_index // self.frame_step >= self.emit_start_ordinal:
+                    yield ready_frame
+        assert not current_sliding_window, "Current sliding window should be empty"
 
     def update_iterator(self, previous_iterator: Iterator[VideoFrame], pass_idx: int) -> Iterator[VideoFrame]:
         if pass_idx == 0:

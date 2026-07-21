@@ -10,10 +10,16 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
+from .depth_options import DenseDepthOptions
 from .output_paths import resolve_output_path
 
 
-def build_pipeline(output: Path, pipeline_name: str, save_viz: bool = False):
+def build_pipeline(
+    output: Path,
+    pipeline_name: str,
+    save_viz: bool = False,
+    depth_options: DenseDepthOptions | None = None,
+):
     """Construct the bounded-memory annotation pipeline without Hydra."""
 
     from vipe import get_config_path
@@ -28,6 +34,7 @@ def build_pipeline(output: Path, pipeline_name: str, save_viz: bool = False):
         choices = ", ".join(sorted(presets))
         raise ValueError(f"Unsupported minimal pipeline '{pipeline_name}'. Choose one of: {choices}")
     keyframe_depth, dense_depth = presets[pipeline_name]
+    depth_options = depth_options or DenseDepthOptions.from_preset("quality")
 
     slam = OmegaConf.load(get_config_path() / "slam" / "default.yaml")
     slam.optimize_intrinsics = True
@@ -44,7 +51,20 @@ def build_pipeline(output: Path, pipeline_name: str, save_viz: bool = False):
             "instance": None,
         }
     )
-    post = OmegaConf.create({"depth_align_model": dense_depth})
+    post = OmegaConf.create(
+        {
+            "depth_align_model": dense_depth,
+            "dav3_model": depth_options.model,
+            "dav3_model_path": depth_options.model_path,
+            "depth_frame_step": depth_options.frame_step,
+            "dav3_process_res": depth_options.process_res,
+            "dav3_process_res_method": depth_options.process_res_method,
+            "depth_output_resolution": depth_options.output_resolution,
+            "depth_shard_size": depth_options.shard_size,
+            "depth_inference_start_ordinal": 0,
+            "depth_emit_start_ordinal": 0,
+        }
+    )
     output_config = OmegaConf.create(
         {
             "path": str(Path(output).resolve()),
@@ -68,6 +88,8 @@ def run_inference(
     start_frame: int | None = None,
     end_frame: int | None = None,
     artifact_name: str | None = None,
+    mode: str = "full",
+    depth_options: DenseDepthOptions | None = None,
 ) -> None:
     """Decode one continuous video and run the minimal static-scene pipeline."""
 
@@ -95,7 +117,8 @@ def run_inference(
         RawMp4Stream(video, seek_range=seek_range, name=artifact_name),
         [],
     )
-    build_pipeline(output, pipeline_name, save_viz=save_viz).run(stream)
+    pipeline = build_pipeline(output, pipeline_name, save_viz=save_viz, depth_options=depth_options)
+    pipeline.run_mode(stream, mode=mode, frame_index_offset=0 if start_frame is None else int(start_frame))
     logger.info("Finished minimal VIPE inference")
 
 
@@ -113,9 +136,32 @@ def main() -> None:
     parser.add_argument("--start-frame", type=int, default=None, help="Inclusive source frame for chunked inference")
     parser.add_argument("--end-frame", type=int, default=None, help="Exclusive source frame for chunked inference")
     parser.add_argument("--artifact-name", default=None, help="Override the artifact basename")
+    parser.add_argument("--mode", choices=("full", "pose", "depth"), default="full")
+    parser.add_argument("--depth-preset", choices=("preview", "balanced", "quality"), default="quality")
+    parser.add_argument("--dav3-model", choices=("giant", "large", "base", "small"), default=None)
+    parser.add_argument("--dav3-model-path", default=None, help="Local checkpoint directory or Hugging Face id")
+    parser.add_argument("--depth-frame-step", type=int, default=None)
+    parser.add_argument("--dav3-process-res", type=int, default=None)
+    parser.add_argument(
+        "--dav3-resize-method",
+        choices=("lower_bound_resize", "upper_bound_resize"),
+        default=None,
+    )
+    parser.add_argument("--depth-output-resolution", choices=("original", "model"), default=None)
+    parser.add_argument("--depth-shard-size", type=int, default=490)
     args = parser.parse_args()
     if not args.video.is_file():
         parser.error(f"Video does not exist: {args.video}")
+    depth_options = DenseDepthOptions.from_preset(
+        args.depth_preset,
+        model=args.dav3_model,
+        model_path=args.dav3_model_path,
+        frame_step=args.depth_frame_step,
+        process_res=args.dav3_process_res,
+        process_res_method=args.dav3_resize_method,
+        output_resolution=args.depth_output_resolution,
+        shard_size=args.depth_shard_size,
+    )
     run_inference(
         args.video,
         args.output,
@@ -124,6 +170,8 @@ def main() -> None:
         start_frame=args.start_frame,
         end_frame=args.end_frame,
         artifact_name=args.artifact_name,
+        mode=args.mode,
+        depth_options=depth_options,
     )
 
 

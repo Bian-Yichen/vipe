@@ -25,13 +25,11 @@ For each full video or manually selected segment, `OUTPUT/maps/NAME/` contains:
 Native VIPE artifacts remain in `OUTPUT/vipe_artifacts/`: RGB, per-frame poses,
 intrinsics, half-float EXR depth zip, diagnostic metadata, and the SLAM map.
 
-The room-tour entry point writes these artifacts with bounded memory.  It does
-not cache every full-resolution RGB-D frame: RGB is encoded during DAv3's
-existing keyframe pre-pass, and each final full-resolution DAv3 depth is written
-to the EXR zip as soon as it is produced.  Pose, intrinsics, and the SLAM map
-are checkpointed before dense depth, allowing a failed post-process to resume
-without repeating SLAM.  This changes storage only; SLAM, DAv3 windows,
-overlap blending, depth resolution, and artifact numeric precision are unchanged.
+The room-tour entry point writes these artifacts with bounded memory. It does
+not cache every RGB-D frame. Pose, intrinsics, and the SLAM map are committed
+before post-SLAM DAv3 starts. Dense depth is then committed in resumable shards
+and assembled into the normal EXR ZIP after success. The existing DAv3 temporal
+window remains 10 frames with 3 overlap frames in every preset.
 
 ## Install
 
@@ -41,7 +39,7 @@ branch of the repository:
 ```bash
 git clone https://github.com/Bian-Yichen/vipe.git
 cd vipe
-git checkout agent/roomtour-topdown-map
+git checkout agent/roomtour-chunked-sim3
 
 # Use the same ViPE installation method/environment you normally use.
 # Editable install exposes both commands. Hydra is not needed by vipe-roomtour.
@@ -71,6 +69,8 @@ top-down PNG files for QA instead.
 ViPE downloads model weights on first use. The `roomtour_dav3` pipeline uses
 Depth Anything 3 and is the recommended high-quality setting. Review the
 third-party model licenses described by upstream VIPE before large-scale use.
+`quality` uses DA3-GIANT as before. `preview` and `balanced` use DA3-LARGE, so
+that checkpoint must also be downloaded/cached before an offline compute job.
 
 ## Run one complete video
 
@@ -81,6 +81,23 @@ current ViPE checkout.
 ```bash
 vipe-roomtour run /data/video.mp4 /mnt/petrelfs/user/results/video_001 \
   --pipeline roomtour_dav3
+```
+
+For rapid calibration QA, stop before the expensive all-frame dense-depth
+stage. This still exports original-resolution intrinsics and c2w/w2c for every
+frame:
+
+```bash
+vipe-roomtour run /data/video.mp4 /mnt/petrelfs/user/results/video_001 \
+  --pipeline roomtour_dav3 --pose-only
+```
+
+Later, reuse that exact SLAM checkpoint and add preview depth/map without
+re-estimating pose:
+
+```bash
+vipe-roomtour run /data/video.mp4 /mnt/petrelfs/user/results/video_001 \
+  --pipeline roomtour_dav3 --depth-only --depth-preset preview
 ```
 
 ## Long tours: overlapping chunk solve and Sim(3) stitch
@@ -95,6 +112,26 @@ vipe-roomtour chunked-run /data/villa_25000_frames.mp4 /mnt/petrelfs/user/result
   --chunk-frames 5000 \
   --overlap-frames 500
 ```
+
+The chunked command now runs in three explicit phases: all chunk SLAM solves,
+pose-overlap validation, then dense depth/map. A fast pose-only pass is:
+
+```bash
+vipe-roomtour chunked-run /data/villa_25000_frames.mp4 /mnt/petrelfs/user/results/villa_chunked \
+  --chunk-frames 5000 --overlap-frames 500 --pose-only
+```
+
+To continue with the fast preview preset on four allocated GPUs:
+
+```bash
+srun -p vcg --gres=gpu:4 \
+  vipe-roomtour chunked-run /data/villa_25000_frames.mp4 /mnt/petrelfs/user/results/villa_chunked \
+  --chunk-frames 5000 --overlap-frames 500 \
+  --depth-only --depth-preset preview --depth-workers 4
+```
+
+Each worker owns one visible GPU and processes independent chunk DAv3 jobs.
+This parallelism does not alter chunk poses or the DAv3 3/10 overlap blending.
 
 The half-open blocks are `[0,5000)`, `[4500,9500)`, and so on. They are read
 directly from the original MP4; no lossy intermediate clip is created. Every
@@ -138,8 +175,30 @@ different internal grid, the mapper independently scales x/y intrinsics only
 for backprojection; `calibration.npz` and CSV keep the original-resolution
 values.
 
-For long videos, start with the defaults (`--frame-step 5 --pixel-stride 4`).
-For a denser map, try `--frame-step 2 --pixel-stride 2`; memory and runtime rise
+The depth presets affect only the post-SLAM dense-depth/map stage:
+
+| Preset | Model | True DAv3 frame step | Resize | Saved depth grid |
+| --- | --- | ---: | --- | --- |
+| `preview` | DA3-LARGE | 5 | long side 504 | model grid |
+| `balanced` | DA3-LARGE | 2 | short side 504 | model grid |
+| `quality` | DA3-GIANT | 1 | short side 504 | original RGB grid |
+
+`--depth-frame-step` now skips DAv3 forward passes rather than merely dropping
+depth during mapping. Unless `--frame-step` is explicitly supplied, preview and
+balanced fuse every generated sparse depth; quality retains the previous map
+default of every fifth source frame. All-frame pose/intrinsics are unchanged.
+Individual preset values can be overridden with `--dav3-model`,
+`--dav3-model-path`, `--dav3-process-res`, `--dav3-resize-method`, and
+`--depth-output-resolution`. The 3-frame overlap is intentionally not exposed
+as a tuning option.
+
+Completed depth shards are kept under `depth/NAME.zip.parts/` after an
+interrupted job. Rerunning the identical command resumes from the last complete
+490-depth shard with one preceding window of context. After successful final
+ZIP publication, that temporary shard directory is removed.
+
+For a denser final map, override both inference and pixel sampling, for example
+`--depth-frame-step 2 --frame-step 2 --pixel-stride 2`; memory and runtime rise
 substantially. `--visualize-vipe` is intentionally skipped by this bounded-memory
 path because retaining its full RGB-D input would reintroduce length-dependent
 memory use.
@@ -175,6 +234,10 @@ Or resume the exact `run` layout:
 ```bash
 vipe-roomtour run /data/video.mp4 /data/output/video_001 --skip-inference
 ```
+
+`--skip-inference` now verifies that the saved depth metadata matches the
+requested preset/overrides; it will not silently reuse a map made by a
+different DAv3 model or frame step.
 
 ## Useful tuning
 

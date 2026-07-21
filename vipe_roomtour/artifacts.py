@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .depth_options import DenseDepthOptions
 from .geometry import intrinsics_matrix
 
 
@@ -44,10 +45,40 @@ class ArtifactSet:
     def info(self) -> Path:
         return self.root / "vipe" / f"{self.name}_info.pkl"
 
+    @property
+    def slam_map(self) -> Path:
+        return self.root / "vipe" / f"{self.name}_slam_map.pt"
+
+    @property
+    def depth_metadata(self) -> Path:
+        return self.root / "depth" / f"{self.name}_metadata.json"
+
+    def validate_calibration(self) -> None:
+        missing = [
+            path
+            for path in (self.pose, self.intrinsics, self.camera_type, self.info, self.slam_map)
+            if not path.exists()
+        ]
+        if missing:
+            raise FileNotFoundError("Missing VIPE calibration checkpoint: " + ", ".join(str(p) for p in missing))
+
     def validate(self) -> None:
         missing = [p for p in (self.rgb, self.pose, self.intrinsics, self.depth) if not p.exists()]
         if missing:
             raise FileNotFoundError("Missing VIPE artifacts: " + ", ".join(str(p) for p in missing))
+
+    def depth_matches(self, options: DenseDepthOptions) -> bool:
+        if not all(path.exists() for path in (self.rgb, self.depth, self.pose, self.intrinsics)):
+            return False
+        if not self.depth_metadata.exists():
+            # Artifacts produced by the preceding streaming branch had exactly
+            # the quality preset but no sidecar. Reuse those without an
+            # expensive, numerically redundant DAv3 rerun.
+            return options.inference_config() == DenseDepthOptions.from_preset("quality").inference_config()
+        try:
+            return json.loads(self.depth_metadata.read_text()) == options.inference_config()
+        except (OSError, ValueError, TypeError):
+            return False
 
 
 @dataclass(frozen=True)

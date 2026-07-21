@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from .artifacts import ArtifactSet
-from .map_builder import MapOptions, build_map
+from .artifacts import ArtifactSet, export_calibration, load_calibration
+from .depth_options import DenseDepthOptions
+from .map_builder import MapOptions, build_map, probe_video
 from .output_paths import resolve_output_path
 from .segments import Segment, cut_segment
 
@@ -29,6 +31,9 @@ def _run_vipe(
     start_frame: int | None = None,
     end_frame: int | None = None,
     artifact_name: str | None = None,
+    mode: str = "full",
+    depth_options: DenseDepthOptions | None = None,
+    cuda_visible_device: str | None = None,
 ) -> None:
     command = [
         sys.executable,
@@ -39,6 +44,8 @@ def _run_vipe(
         str(artifact_root),
         "--pipeline",
         pipeline,
+        "--mode",
+        mode,
     ]
     if visualize:
         command.append("--visualize")
@@ -48,8 +55,15 @@ def _run_vipe(
         command.extend(["--end-frame", str(end_frame)])
     if artifact_name is not None:
         command.extend(["--artifact-name", artifact_name])
+    if depth_options is not None:
+        command.extend(depth_options.subprocess_args())
     logger.info("Running: %s", " ".join(command))
-    subprocess.run(command, check=True)
+    environment = None
+    if cuda_visible_device is not None:
+        environment = os.environ.copy()
+        environment["CUDA_VISIBLE_DEVICES"] = cuda_visible_device
+        logger.info("Assigning dense-depth subprocess to CUDA_VISIBLE_DEVICES=%s", cuda_visible_device)
+    subprocess.run(command, check=True, env=environment)
 
 
 def run_roomtour(
@@ -63,12 +77,15 @@ def run_roomtour(
     skip_inference: bool = False,
     skip_map: bool = False,
     overwrite_segments: bool = False,
+    inference_mode: str = "full",
+    depth_options: DenseDepthOptions | None = None,
 ) -> dict:
     input_video = Path(input_video).resolve()
     output_root = resolve_output_path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     artifact_root = output_root / "vipe_artifacts"
     artifact_root.mkdir(parents=True, exist_ok=True)
+    depth_options = depth_options or DenseDepthOptions.from_preset("quality")
 
     jobs: list[tuple[str, Path, float]] = []
     if segments:
@@ -85,21 +102,62 @@ def run_roomtour(
         "input_video": str(input_video),
         "output_root": str(output_root),
         "pipeline": pipeline,
+        "inference_mode": inference_mode,
+        "dense_depth": depth_options.to_dict(),
         "segments": [asdict(segment) for segment in segments],
         "jobs": [],
     }
     for name, video_path, source_offset in jobs:
         artifact = ArtifactSet(artifact_root, name)
-        if not skip_inference:
+        if inference_mode == "pose":
+            calibration_complete = True
             try:
-                artifact.validate()
-                artifacts_complete = True
+                artifact.validate_calibration()
             except FileNotFoundError:
-                artifacts_complete = False
-            if artifacts_complete:
-                logger.info("Complete artifacts already exist for %s; skipping inference", name)
-            else:
-                _run_vipe(video_path, artifact_root, pipeline, visualize_vipe)
+                calibration_complete = False
+            if not calibration_complete:
+                if skip_inference:
+                    artifact.validate_calibration()
+                _run_vipe(video_path, artifact_root, pipeline, visualize_vipe, mode="pose")
+            artifact.validate_calibration()
+            calibration = load_calibration(artifact)
+            map_dir = output_root / "maps" / name
+            video_info = probe_video(video_path)
+            export_calibration(
+                calibration,
+                map_dir,
+                fps=float(video_info["fps"]),
+                source_time_offset=source_offset,
+                image_wh=(int(video_info["width"]), int(video_info["height"])),
+            )
+            manifest["jobs"].append(
+                {
+                    "name": name,
+                    "video": str(video_path),
+                    "source_time_offset_seconds": source_offset,
+                    "artifact_root": str(artifact_root),
+                    "map_dir": str(map_dir),
+                    "metrics": None,
+                }
+            )
+            (output_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+            continue
+
+        if skip_inference:
+            artifact.validate()
+            if not artifact.depth_matches(depth_options):
+                raise FileNotFoundError(f"Existing depth artifacts do not match requested config for {name}")
+        elif artifact.depth_matches(depth_options):
+            logger.info("Matching complete artifacts already exist for %s; skipping inference", name)
+        else:
+            _run_vipe(
+                video_path,
+                artifact_root,
+                pipeline,
+                visualize_vipe,
+                mode="depth" if inference_mode == "depth" else "full",
+                depth_options=depth_options,
+            )
         artifact.validate()
         map_dir = output_root / "maps" / name
         metrics = None

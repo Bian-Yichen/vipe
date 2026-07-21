@@ -8,8 +8,11 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
+import queue
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +21,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .artifacts import ArtifactSet, Calibration, export_calibration, load_calibration, write_ply
+from .depth_options import DenseDepthOptions
 from .fusion import VoxelAccumulator
 from .geometry import estimate_floor_y, estimate_level_frame, intrinsics_matrix, pose_tilt_degrees
 from .map_builder import MapOptions, build_map, probe_video
@@ -445,14 +449,17 @@ def read_binary_ply(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return points, colors, observations
 
 
-def _chunk_map_is_current(map_dir: Path, options: MapOptions) -> bool:
+def _chunk_map_is_current(map_dir: Path, options: MapOptions, artifact: ArtifactSet) -> bool:
     metadata_path = map_dir / "map_metadata.json"
     required = (map_dir / "global_rgb_map_world.ply", map_dir / "calibration.npz", metadata_path)
     if not all(path.exists() for path in required):
         return False
     try:
         metadata = json.loads(metadata_path.read_text())
-        return metadata.get("map_options") == asdict(options)
+        depth_metadata = (
+            json.loads(artifact.depth_metadata.read_text()) if artifact.depth_metadata.exists() else None
+        )
+        return metadata.get("map_options") == asdict(options) and metadata.get("dense_depth") == depth_metadata
     except (OSError, ValueError, TypeError):
         return False
 
@@ -665,6 +672,124 @@ def stitch_chunk_results(
     return metrics
 
 
+def stitch_chunk_pose_results(
+    chunks: list[ChunkResult],
+    output_dir: Path,
+    *,
+    total_frames: int,
+    fps: float,
+    image_wh: tuple[int, int],
+    overlap_frames: int,
+    thresholds: StitchThresholds,
+) -> dict[str, Any]:
+    """Export a globally continuous all-frame trajectory without running dense DAv3."""
+
+    if not chunks:
+        raise ValueError("No chunks to stitch")
+    chunks[0].transform = SimilarityTransform.identity()
+    stitch_metrics = [
+        _align_adjacent_chunks(previous, current, thresholds)
+        for previous, current in zip(chunks[:-1], chunks[1:], strict=True)
+    ]
+    calibration, depth_scales, primary_chunks = merge_chunk_calibrations(
+        chunks,
+        total_frames=total_frames,
+        overlap_frames=overlap_frames,
+    )
+    output_dir = resolve_output_path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    export_calibration(calibration, output_dir, fps=fps, image_wh=image_wh)
+    chunk_scales = np.asarray([chunk.transform.scale for chunk in chunks], dtype=np.float64)
+    _write_frame_assignment(
+        output_dir / "per_frame_chunk_assignment.csv",
+        calibration.indices,
+        primary_chunks,
+        depth_scales,
+        chunk_scales,
+    )
+    level = estimate_level_frame(calibration.c2w)
+    trajectory_world = calibration.c2w[:, :3, 3]
+    trajectory_level = level.transform_points(trajectory_world)
+    _write_global_trajectory(output_dir / "trajectory.csv", calibration, fps, trajectory_level)
+    transforms = [
+        {
+            "chunk": asdict(chunk.spec),
+            "name": chunk.spec.name,
+            "artifact_root": str(chunk.artifact.root),
+            "local_to_global": chunk.transform.to_dict(),
+            "depth_scale_to_global": float(chunk.transform.scale),
+        }
+        for chunk in chunks
+    ]
+    (output_dir / "chunk_transforms.json").write_text(json.dumps(transforms, indent=2) + "\n")
+    (output_dir / "stitch_metrics.json").write_text(json.dumps(stitch_metrics, indent=2) + "\n")
+    step_distances = np.linalg.norm(np.diff(trajectory_world, axis=0), axis=1)
+    metrics = {
+        "mode": "pose_only",
+        "total_frames": int(total_frames),
+        "chunk_count": len(chunks),
+        "overlap_frames": int(overlap_frames),
+        "path_length_global_units": float(step_distances.sum()),
+        "max_frame_translation_global_units": float(step_distances.max(initial=0.0)),
+        "stitches": stitch_metrics,
+        "scale_anchor": "chunk 0; monocular metric scale is not guaranteed to be physically exact",
+    }
+    (output_dir / "pose_quality_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    return metrics
+
+
+def _cuda_devices(depth_workers: int) -> list[str]:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    devices = [item.strip() for item in visible.split(",") if item.strip()] if visible else []
+    if not devices:
+        devices = [str(index) for index in range(depth_workers)]
+    if depth_workers > len(devices):
+        raise ValueError(
+            f"Requested {depth_workers} depth workers but only {len(devices)} CUDA devices are visible: {devices}"
+        )
+    return devices[:depth_workers]
+
+
+def _run_chunk_depth_jobs(
+    jobs: list[ChunkResult],
+    *,
+    input_video: Path,
+    pipeline: str,
+    artifact_root: Path,
+    depth_options: DenseDepthOptions,
+    depth_workers: int,
+) -> None:
+    if not jobs:
+        return
+    devices: queue.Queue[str] = queue.Queue()
+    for device in _cuda_devices(depth_workers):
+        devices.put(device)
+
+    def run_one(chunk: ChunkResult) -> None:
+        device = devices.get()
+        try:
+            _run_vipe(
+                input_video,
+                artifact_root,
+                pipeline,
+                False,
+                start_frame=chunk.spec.start_frame,
+                end_frame=chunk.spec.end_frame,
+                artifact_name=chunk.spec.name,
+                mode="depth",
+                depth_options=depth_options,
+                cuda_visible_device=device,
+            )
+        finally:
+            devices.put(device)
+
+    logger.info("Running dense DAv3 for %d chunks on %d GPU worker(s)", len(jobs), depth_workers)
+    with ThreadPoolExecutor(max_workers=depth_workers) as executor:
+        futures = [executor.submit(run_one, chunk) for chunk in jobs]
+        for future in futures:
+            future.result()
+
+
 def run_chunked_roomtour(
     input_video: Path,
     output_root: Path,
@@ -676,6 +801,9 @@ def run_chunked_roomtour(
     thresholds: StitchThresholds,
     skip_inference: bool = False,
     skip_chunk_maps: bool = False,
+    inference_mode: str = "full",
+    depth_options: DenseDepthOptions | None = None,
+    depth_workers: int = 1,
 ) -> dict[str, Any]:
     input_video = Path(input_video).resolve()
     output_root = resolve_output_path(output_root)
@@ -687,6 +815,11 @@ def run_chunked_roomtour(
     chunk_root = output_root / "chunks"
     artifact_root.mkdir(parents=True, exist_ok=True)
     chunk_root.mkdir(parents=True, exist_ok=True)
+    if inference_mode not in {"full", "pose", "depth"}:
+        raise ValueError(f"Unsupported inference mode: {inference_mode}")
+    if depth_workers < 1:
+        raise ValueError("depth_workers must be >= 1")
+    depth_options = depth_options or DenseDepthOptions.from_preset("quality")
 
     logger.info(
         "Chunking %d frames into %d chunks (max=%d, overlap=%d)",
@@ -701,22 +834,27 @@ def run_chunked_roomtour(
         "total_frames": total_frames,
         "fps": video_info["fps"],
         "pipeline": pipeline,
+        "inference_mode": inference_mode,
+        "dense_depth": depth_options.to_dict(),
+        "depth_workers": depth_workers,
         "chunk_frames": chunk_frames,
         "overlap_frames": overlap_frames,
         "map_options": asdict(map_options),
         "stitch_thresholds": asdict(thresholds),
         "chunks": [],
     }
+    # Phase 1: finish and validate all-frame SLAM calibration for every chunk.
+    # Dense DAv3 is not loaded in this phase.
     for spec in specs:
         artifact = ArtifactSet(artifact_root, spec.name)
-        artifacts_complete = True
+        calibration_complete = True
         try:
-            artifact.validate()
+            artifact.validate_calibration()
         except FileNotFoundError:
-            artifacts_complete = False
-        if not artifacts_complete:
-            if skip_inference:
-                artifact.validate()
+            calibration_complete = False
+        if not calibration_complete:
+            if skip_inference or inference_mode == "depth":
+                artifact.validate_calibration()
             _run_vipe(
                 input_video,
                 artifact_root,
@@ -725,10 +863,11 @@ def run_chunked_roomtour(
                 start_frame=spec.start_frame,
                 end_frame=spec.end_frame,
                 artifact_name=spec.name,
+                mode="pose",
             )
         else:
-            logger.info("Complete VIPE artifacts already exist for %s", spec.name)
-        artifact.validate()
+            logger.info("Complete SLAM checkpoint already exists for %s", spec.name)
+        artifact.validate_calibration()
 
         map_dir = chunk_root / spec.name
         calibration = load_calibration(artifact)
@@ -738,21 +877,8 @@ def run_chunked_roomtour(
             )
         result = ChunkResult(spec, artifact, map_dir, calibration, SimilarityTransform.identity())
         if results:
-            # Validate this boundary before building its map or spending hours
-            # on any later chunk.
+            # Reject a bad pose boundary before spending hours on dense depth.
             _align_adjacent_chunks(results[-1], result, thresholds)
-
-        if not _chunk_map_is_current(map_dir, map_options):
-            if skip_chunk_maps:
-                raise FileNotFoundError(f"Missing or stale chunk map: {map_dir}")
-            build_map(
-                artifact,
-                map_dir,
-                map_options,
-                source_time_offset=spec.start_frame / float(video_info["fps"]),
-            )
-        else:
-            logger.info("Current chunk map already exists for %s", spec.name)
         results.append(result)
         manifest["chunks"].append(
             {
@@ -763,6 +889,52 @@ def run_chunked_roomtour(
             }
         )
         (output_root / "chunk_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+    if inference_mode == "pose":
+        metrics = stitch_chunk_pose_results(
+            results,
+            output_root / "global",
+            total_frames=total_frames,
+            fps=float(video_info["fps"]),
+            image_wh=(int(video_info["width"]), int(video_info["height"])),
+            overlap_frames=overlap_frames,
+            thresholds=thresholds,
+        )
+        manifest["global_output"] = str(output_root / "global")
+        manifest["metrics"] = metrics
+        (output_root / "chunk_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        return manifest
+
+    # Phase 2: DAv3 is independent across chunks after pose alignment, so run
+    # one subprocess per available GPU. Existing matching depth is reused.
+    depth_jobs = [chunk for chunk in results if not chunk.artifact.depth_matches(depth_options)]
+    if depth_jobs and skip_inference:
+        missing = ", ".join(chunk.spec.name for chunk in depth_jobs)
+        raise FileNotFoundError(f"Missing or mismatched dense-depth artifacts: {missing}")
+    _run_chunk_depth_jobs(
+        depth_jobs,
+        input_video=input_video,
+        pipeline=pipeline,
+        artifact_root=artifact_root,
+        depth_options=depth_options,
+        depth_workers=depth_workers,
+    )
+
+    # Phase 3: build per-chunk RGB-D maps only after all requested depth is
+    # complete. This keeps GPU depth workers independent from CPU map fusion.
+    for result in results:
+        result.artifact.validate()
+        if not _chunk_map_is_current(result.map_dir, map_options, result.artifact):
+            if skip_chunk_maps:
+                raise FileNotFoundError(f"Missing or stale chunk map: {result.map_dir}")
+            build_map(
+                result.artifact,
+                result.map_dir,
+                map_options,
+                source_time_offset=result.spec.start_frame / float(video_info["fps"]),
+            )
+        else:
+            logger.info("Current chunk map already exists for %s", result.spec.name)
 
     metrics = stitch_chunk_results(
         results,

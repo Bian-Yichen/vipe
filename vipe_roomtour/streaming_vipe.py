@@ -13,9 +13,11 @@ writes RGB and depth while the two-pass multiview-depth stream is consumed.
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import os
 import pickle
+import shutil
 import tempfile
 import zipfile
 from pathlib import Path
@@ -29,6 +31,7 @@ import torch
 from vipe.ext.lietorch import SE3
 from vipe.pipeline import AnnotationPipelineOutput
 from vipe.pipeline.default import DefaultAnnotationPipeline
+from vipe.pipeline.processors import MultiviewDepthProcessor
 from vipe.slam.interface import SLAMMap, SLAMOutput
 from vipe.slam.system import SLAMSystem
 from vipe.streams.base import (
@@ -82,6 +85,11 @@ class StreamingRGBWriterProcessor(StreamProcessor):
 
     def update_iterator(self, previous_iterator: Iterator[VideoFrame], pass_idx: int) -> Iterator[VideoFrame]:
         if pass_idx != 0:
+            yield from previous_iterator
+            return
+
+        if self.path.exists():
+            # A resumed depth-only job can reuse the already committed RGB.
             yield from previous_iterator
             return
 
@@ -144,6 +152,136 @@ def save_depth_artifacts_streaming(path: Path, stream: VideoStream) -> int:
         partial.unlink(missing_ok=True)
         raise
     return frame_count
+
+
+def _depth_parts_dir(path: Path) -> Path:
+    return path.with_name(f"{path.name}.parts")
+
+
+def _depth_metadata_path(path: Path) -> Path:
+    return path.with_name(f"{path.stem}_metadata.json")
+
+
+def _shard_path(parts_dir: Path, start: int, end: int) -> Path:
+    return parts_dir / f"{start:08d}_{end:08d}.zip"
+
+
+def _zip_frame_indices(path: Path) -> list[int]:
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            if archive.testzip() is not None:
+                return []
+            return [int(name.rsplit("/", 1)[-1].split(".", 1)[0]) for name in sorted(archive.namelist())]
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return []
+
+
+def prepare_depth_shards(
+    path: Path,
+    expected_indices: list[int],
+    shard_size: int,
+    config: dict,
+) -> tuple[Path, int]:
+    """Return the current config's shard directory and contiguous completed prefix."""
+
+    parts_dir = _depth_parts_dir(path)
+    manifest_path = parts_dir / "manifest.json"
+    if parts_dir.exists():
+        try:
+            existing = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            existing = None
+        if existing != config:
+            logger.warning("Discarding incompatible partial depth shards in %s", parts_dir)
+            shutil.rmtree(parts_dir)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+    completed = 0
+    while completed < len(expected_indices):
+        end = min(completed + shard_size, len(expected_indices))
+        shard = _shard_path(parts_dir, completed, end)
+        if _zip_frame_indices(shard) != expected_indices[completed:end]:
+            break
+        completed = end
+    return parts_dir, completed
+
+
+def _assemble_depth_archive(path: Path, parts_dir: Path, expected_indices: list[int], shard_size: int) -> None:
+    partial = path.with_name(f"{path.name}.partial")
+    partial.unlink(missing_ok=True)
+    try:
+        with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as output:
+            for start in range(0, len(expected_indices), shard_size):
+                end = min(start + shard_size, len(expected_indices))
+                shard = _shard_path(parts_dir, start, end)
+                with zipfile.ZipFile(shard, "r") as source:
+                    for name in sorted(source.namelist()):
+                        output.writestr(name, source.read(name))
+        os.replace(partial, path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+
+
+def save_depth_artifacts_sharded(
+    path: Path,
+    stream: VideoStream,
+    *,
+    expected_indices: list[int],
+    shard_size: int,
+    parts_dir: Path,
+    completed: int,
+    frame_index_offset: int,
+) -> int:
+    """Commit resumable depth shards, then atomically publish the legacy ZIP."""
+
+    path.parent.mkdir(exist_ok=True, parents=True)
+    ordinal = completed
+    archive: zipfile.ZipFile | None = None
+    partial_shard: Path | None = None
+    final_shard: Path | None = None
+    try:
+        for frame in stream:
+            if frame.metric_depth is None:
+                continue
+            local_index = int(frame.raw_frame_idx) - int(frame_index_offset)
+            if ordinal >= len(expected_indices) or local_index != expected_indices[ordinal]:
+                raise RuntimeError(
+                    f"Unexpected sparse depth frame {local_index}; expected ordinal {ordinal} "
+                    f"({expected_indices[ordinal] if ordinal < len(expected_indices) else 'end'})"
+                )
+            if archive is None:
+                shard_start = (ordinal // shard_size) * shard_size
+                shard_end = min(shard_start + shard_size, len(expected_indices))
+                final_shard = _shard_path(parts_dir, shard_start, shard_end)
+                partial_shard = final_shard.with_name(f"{final_shard.name}.partial")
+                partial_shard.unlink(missing_ok=True)
+                archive = zipfile.ZipFile(partial_shard, "w", zipfile.ZIP_DEFLATED)
+
+            depth = frame.metric_depth.detach().cpu().numpy().astype(np.float16, copy=False)
+            with tempfile.NamedTemporaryFile(suffix=".exr") as temp:
+                _write_depth_exr(depth, Path(temp.name))
+                archive.write(temp.name, f"{local_index:08d}.exr")
+            ordinal += 1
+            if ordinal % shard_size == 0 or ordinal == len(expected_indices):
+                archive.close()
+                archive = None
+                assert partial_shard is not None and final_shard is not None
+                os.replace(partial_shard, final_shard)
+            del depth, frame
+    except BaseException:
+        if archive is not None:
+            archive.close()
+        if partial_shard is not None:
+            partial_shard.unlink(missing_ok=True)
+        raise
+
+    if ordinal != len(expected_indices):
+        raise RuntimeError(f"Expected {len(expected_indices)} sparse depth frames, completed {ordinal}")
+    _assemble_depth_archive(path, parts_dir, expected_indices, shard_size)
+    shutil.rmtree(parts_dir)
+    return ordinal
 
 
 def _save_slam_checkpoint(artifact: io.ArtifactPath, slam_output: SLAMOutput, n_frames: int) -> None:
@@ -223,15 +361,61 @@ def _move_slam_map_to_cpu(slam_output: SLAMOutput) -> None:
 class StreamingRoomTourPipeline(DefaultAnnotationPipeline):
     """Stock single-view ViPE inference with bounded-memory artifact output."""
 
-    def run(self, video_data: VideoStream | MultiviewVideoList) -> AnnotationPipelineOutput:
-        if isinstance(video_data, MultiviewVideoList):
-            raise NotImplementedError("The room-tour streaming pipeline currently supports one video stream")
+    def _depth_config(self) -> dict:
+        return {
+            "model": str(self.post_cfg.dav3_model),
+            "model_path": self.post_cfg.dav3_model_path,
+            "frame_step": int(self.post_cfg.depth_frame_step),
+            "process_res": int(self.post_cfg.dav3_process_res),
+            "process_res_method": str(self.post_cfg.dav3_process_res_method),
+            "output_resolution": str(self.post_cfg.depth_output_resolution),
+            "window_size": 10,
+            "overlap_size": 3,
+        }
 
-        artifact = io.ArtifactPath(self.out_path, video_data.name())
+    def _add_post_processors(
+        self, view_idx: int, video_stream: VideoStream, slam_output: SLAMOutput
+    ) -> ProcessedVideoStream:
+        if self.post_cfg.depth_align_model != "mvd_dav3":
+            return super()._add_post_processors(view_idx, video_stream, slam_output)
+        processors: list[StreamProcessor] = [
+            AssignAttributesProcessor(
+                {
+                    FrameAttribute.POSE: slam_output.get_view_trajectory(view_idx),
+                    FrameAttribute.INTRINSICS: [slam_output.intrinsics[view_idx]] * len(video_stream),
+                }
+            ),
+            MultiviewDepthProcessor(
+                slam_output,
+                model="mvd_dav3",
+                window_size=10,
+                overlap_size=3,
+                frame_step=int(self.post_cfg.depth_frame_step),
+                process_res=int(self.post_cfg.dav3_process_res),
+                process_res_method=str(self.post_cfg.dav3_process_res_method),
+                output_resolution=str(self.post_cfg.depth_output_resolution),
+                dav3_model=str(self.post_cfg.dav3_model),
+                dav3_model_path=self.post_cfg.dav3_model_path,
+                inference_start_ordinal=int(self.post_cfg.depth_inference_start_ordinal),
+                emit_start_ordinal=int(self.post_cfg.depth_emit_start_ordinal),
+            ),
+        ]
+        return ProcessedVideoStream(video_stream, processors)
+
+    def _load_or_run_slam(
+        self,
+        video_data: VideoStream,
+        artifact: io.ArtifactPath,
+        *,
+        require_checkpoint: bool,
+    ) -> tuple[VideoStream, SLAMOutput]:
         n_frames = len(video_data)
         slam_output = _load_slam_checkpoint(artifact, n_frames)
-
         if slam_output is None:
+            if require_checkpoint:
+                raise FileNotFoundError(
+                    f"Depth-only mode requires a complete SLAM checkpoint for {artifact.artifact_name}"
+                )
             slam_stream = self._add_init_processors(video_data)
             slam_pipeline = SLAMSystem(
                 device=torch.device("cuda"),
@@ -241,25 +425,90 @@ class StreamingRoomTourPipeline(DefaultAnnotationPipeline):
             slam_output = slam_pipeline.run([slam_stream], rig=None, camera_type=self.camera_type)
             _save_slam_checkpoint(artifact, slam_output, n_frames)
             _move_slam_map_to_cpu(slam_output)
-
-            # DROID, GeoCalib and the keyframe metric-depth model are no longer
-            # needed once the all-frame trajectory and keyframe map are saved.
             self.model_cache.clear()
             del slam_pipeline
             gc.collect()
             torch.cuda.empty_cache()
         else:
-            # A resumed post-process does not need to load GeoCalib again.  It
-            # only needs to restore the camera model attribute that GeoCalib
-            # would attach to every frame.
             slam_stream = ProcessedVideoStream(
                 video_data,
-                [
-                    AssignAttributesProcessor(
-                        {FrameAttribute.CAMERA_TYPE: [self.camera_type] * n_frames}
-                    )
-                ],
+                [AssignAttributesProcessor({FrameAttribute.CAMERA_TYPE: [self.camera_type] * n_frames})],
             )
+        return slam_stream, slam_output
+
+    def run_mode(
+        self,
+        video_data: VideoStream | MultiviewVideoList,
+        *,
+        mode: str = "full",
+        frame_index_offset: int = 0,
+    ) -> AnnotationPipelineOutput:
+        if isinstance(video_data, MultiviewVideoList):
+            raise NotImplementedError("The room-tour streaming pipeline currently supports one video stream")
+        if mode not in {"full", "pose", "depth"}:
+            raise ValueError(f"Unsupported room-tour inference mode: {mode}")
+
+        artifact = io.ArtifactPath(self.out_path, video_data.name())
+        n_frames = len(video_data)
+        slam_stream, slam_output = self._load_or_run_slam(
+            video_data,
+            artifact,
+            require_checkpoint=mode == "depth",
+        )
+        if mode == "pose":
+            logger.info("Pose-only stage complete for %s; dense DAv3 was not loaded", artifact.artifact_name)
+            return AnnotationPipelineOutput()
+
+        config = self._depth_config()
+        expected_indices = list(range(0, n_frames, int(self.post_cfg.depth_frame_step)))
+        metadata_path = _depth_metadata_path(artifact.depth_path)
+        if artifact.depth_path.exists() and artifact.rgb_path.exists():
+            legacy_quality = {
+                "model": "giant",
+                "model_path": None,
+                "frame_step": 1,
+                "process_res": 504,
+                "process_res_method": "lower_bound_resize",
+                "output_resolution": "original",
+                "window_size": 10,
+                "overlap_size": 3,
+            }
+            try:
+                saved_config = json.loads(metadata_path.read_text()) if metadata_path.exists() else legacy_quality
+                if saved_config == config:
+                    logger.info("Matching dense-depth artifacts already exist for %s", artifact.artifact_name)
+                    return AnnotationPipelineOutput()
+            except (OSError, ValueError):
+                pass
+
+        parts_dir, completed = prepare_depth_shards(
+            artifact.depth_path,
+            expected_indices,
+            int(self.post_cfg.depth_shard_size),
+            {**config, "shard_size": int(self.post_cfg.depth_shard_size)},
+        )
+        window_stride = 10 - 3
+        inference_start = max(0, completed - window_stride) if completed else 0
+        self.post_cfg.depth_inference_start_ordinal = inference_start
+        self.post_cfg.depth_emit_start_ordinal = completed
+        if completed:
+            logger.info(
+                "Resuming DAv3 at sparse depth %d/%d (context begins at %d)",
+                completed,
+                len(expected_indices),
+                inference_start,
+            )
+        if completed == len(expected_indices) and artifact.rgb_path.exists():
+            _assemble_depth_archive(
+                artifact.depth_path,
+                parts_dir,
+                expected_indices,
+                int(self.post_cfg.depth_shard_size),
+            )
+            shutil.rmtree(parts_dir)
+            metadata_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+            logger.info("Published depth archive from completed shards without rerunning DAv3")
+            return AnnotationPipelineOutput()
 
         output_stream = self._add_post_processors(0, slam_stream, slam_output)
         # This processor writes RGB during MultiviewDepthProcessor's mandatory
@@ -267,9 +516,18 @@ class StreamingRoomTourPipeline(DefaultAnnotationPipeline):
         output_stream.processors.insert(1, StreamingRGBWriterProcessor(artifact.rgb_path, video_data.fps()))
 
         logger.info("Streaming RGB and dense depth artifacts to %s", artifact.base_path)
-        depth_count = save_depth_artifacts_streaming(artifact.depth_path, output_stream)
-        if depth_count != n_frames:
-            raise RuntimeError(f"Expected {n_frames} depth frames, wrote {depth_count}")
+        depth_count = save_depth_artifacts_sharded(
+            artifact.depth_path,
+            output_stream,
+            expected_indices=expected_indices,
+            shard_size=int(self.post_cfg.depth_shard_size),
+            parts_dir=parts_dir,
+            completed=completed,
+            frame_index_offset=frame_index_offset,
+        )
+        if depth_count != len(expected_indices):
+            raise RuntimeError(f"Expected {len(expected_indices)} depth frames, wrote {depth_count}")
+        metadata_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
         if self.out_cfg.save_viz:
             logger.warning(
@@ -278,3 +536,6 @@ class StreamingRoomTourPipeline(DefaultAnnotationPipeline):
             )
 
         return AnnotationPipelineOutput()
+
+    def run(self, video_data: VideoStream | MultiviewVideoList) -> AnnotationPipelineOutput:
+        return self.run_mode(video_data)

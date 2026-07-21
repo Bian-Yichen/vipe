@@ -13,18 +13,88 @@ import click
 
 from .artifacts import discover_artifacts
 from .chunked import StitchThresholds, run_chunked_roomtour
+from .depth_options import DenseDepthOptions
 from .map_builder import MapOptions, build_map
 from .runner import run_roomtour
 from .segments import parse_segment
 
 
-def _map_options(**kwargs) -> MapOptions:
+def _map_options(*, default_frame_step: int = 5, **kwargs) -> MapOptions:
+    if kwargs.get("frame_step") is None:
+        kwargs["frame_step"] = default_frame_step
     return MapOptions(**kwargs)
+
+
+def _depth_options(
+    depth_preset: str,
+    dav3_model: str | None,
+    dav3_model_path: Path | None,
+    depth_frame_step: int | None,
+    dav3_process_res: int | None,
+    dav3_resize_method: str | None,
+    depth_output_resolution: str | None,
+    depth_shard_size: int,
+) -> DenseDepthOptions:
+    return DenseDepthOptions.from_preset(
+        depth_preset,
+        model=dav3_model,
+        model_path=str(dav3_model_path) if dav3_model_path is not None else None,
+        frame_step=depth_frame_step,
+        process_res=dav3_process_res,
+        process_res_method=dav3_resize_method,
+        output_resolution=depth_output_resolution,
+        shard_size=depth_shard_size,
+    )
+
+
+def _common_depth_options(function):
+    options = [
+        click.option(
+            "--depth-preset",
+            type=click.Choice(("preview", "balanced", "quality")),
+            default="quality",
+            show_default=True,
+        ),
+        click.option("--dav3-model", type=click.Choice(("giant", "large", "base", "small")), default=None),
+        click.option(
+            "--dav3-model-path",
+            type=click.Path(exists=True, path_type=Path),
+            default=None,
+            help="Local DAv3 checkpoint directory (useful on offline compute nodes).",
+        ),
+        click.option("--depth-frame-step", type=click.IntRange(min=1), default=None),
+        click.option("--dav3-process-res", type=click.IntRange(min=56), default=None),
+        click.option(
+            "--dav3-resize-method",
+            type=click.Choice(("lower_bound_resize", "upper_bound_resize")),
+            default=None,
+        ),
+        click.option(
+            "--depth-output-resolution",
+            type=click.Choice(("original", "model")),
+            default=None,
+        ),
+        click.option(
+            "--depth-shard-size",
+            type=click.IntRange(min=7),
+            default=490,
+            show_default=True,
+            help="Resume checkpoint size; must be divisible by 7 because overlap remains 3/10.",
+        ),
+    ]
+    for option in reversed(options):
+        function = option(function)
+    return function
 
 
 def _common_map_options(function):
     options = [
-        click.option("--frame-step", type=click.IntRange(min=1), default=5, show_default=True, help="Fuse every Nth frame."),
+        click.option(
+            "--frame-step",
+            type=click.IntRange(min=1),
+            default=None,
+            help="Fuse every Nth source frame; defaults to --depth-frame-step for run commands.",
+        ),
         click.option("--pixel-stride", type=click.IntRange(min=1), default=4, show_default=True, help="Depth-pixel sampling stride."),
         click.option("--voxel-size", type=click.FloatRange(min=0.001), default=0.03, show_default=True, help="3D fusion voxel size in metres."),
         click.option("--min-voxel-observations", type=click.IntRange(min=1), default=2, show_default=True, help="Minimum different frames supporting a voxel."),
@@ -68,6 +138,9 @@ def main(verbose: bool) -> None:
 @click.option("--skip-inference", is_flag=True, help="Use artifacts already under OUTPUT/vipe_artifacts.")
 @click.option("--skip-map", is_flag=True, help="Run VIPE only; do not fuse RGB-D.")
 @click.option("--overwrite-segments", is_flag=True, help="Recreate already cut segment videos.")
+@click.option("--pose-only", is_flag=True, help="Stop after all-frame SLAM pose/intrinsics; do not load dense DAv3.")
+@click.option("--depth-only", is_flag=True, help="Require an existing SLAM checkpoint and run only dense depth/map.")
+@_common_depth_options
 @_common_map_options
 def run_command(
     input_video: Path,
@@ -78,22 +151,49 @@ def run_command(
     skip_inference: bool,
     skip_map: bool,
     overwrite_segments: bool,
+    pose_only: bool,
+    depth_only: bool,
+    depth_preset: str,
+    dav3_model: str | None,
+    dav3_model_path: Path | None,
+    depth_frame_step: int | None,
+    dav3_process_res: int | None,
+    dav3_resize_method: str | None,
+    depth_output_resolution: str | None,
+    depth_shard_size: int,
     **map_kwargs,
 ) -> None:
     """Optionally cut INPUT_VIDEO, run VIPE, and create all deliverables."""
 
     try:
+        if pose_only and depth_only:
+            raise ValueError("--pose-only and --depth-only are mutually exclusive")
+        dense_depth = _depth_options(
+            depth_preset,
+            dav3_model,
+            dav3_model_path,
+            depth_frame_step,
+            dav3_process_res,
+            dav3_resize_method,
+            depth_output_resolution,
+            depth_shard_size,
+        )
         segments = [parse_segment(spec) for spec in segment_specs]
         run_roomtour(
             input_video,
             output_root,
             segments=segments,
             pipeline=pipeline,
-            map_options=_map_options(**map_kwargs),
+            map_options=_map_options(
+                default_frame_step=dense_depth.frame_step if dense_depth.frame_step > 1 else 5,
+                **map_kwargs,
+            ),
             visualize_vipe=visualize_vipe,
             skip_inference=skip_inference,
             skip_map=skip_map,
             overwrite_segments=overwrite_segments,
+            inference_mode="pose" if pose_only else "depth" if depth_only else "full",
+            depth_options=dense_depth,
         )
     except (ValueError, FileNotFoundError, RuntimeError, NotImplementedError, subprocess.CalledProcessError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -124,6 +224,10 @@ def run_command(
 @click.option("--max-stitch-scale", type=click.FloatRange(min=0.001), default=2.0, show_default=True)
 @click.option("--skip-inference", is_flag=True, help="Require and reuse all chunk VIPE artifacts.")
 @click.option("--skip-chunk-maps", is_flag=True, help="Require and reuse chunk maps with identical map options.")
+@click.option("--pose-only", is_flag=True, help="Stitch/export all-frame poses without running dense DAv3.")
+@click.option("--depth-only", is_flag=True, help="Require existing chunk SLAM checkpoints; run depth and maps only.")
+@click.option("--depth-workers", type=click.IntRange(min=1), default=1, show_default=True, help="Parallel DAv3 workers, one per visible GPU.")
+@_common_depth_options
 @_common_map_options
 def chunked_run_command(
     input_video: Path,
@@ -138,13 +242,36 @@ def chunked_run_command(
     max_stitch_scale: float,
     skip_inference: bool,
     skip_chunk_maps: bool,
+    pose_only: bool,
+    depth_only: bool,
+    depth_workers: int,
+    depth_preset: str,
+    dav3_model: str | None,
+    dav3_model_path: Path | None,
+    depth_frame_step: int | None,
+    dav3_process_res: int | None,
+    dav3_resize_method: str | None,
+    depth_output_resolution: str | None,
+    depth_shard_size: int,
     **map_kwargs,
 ) -> None:
     """Solve overlapping chunks independently and stitch them in Sim(3)."""
 
     try:
+        if pose_only and depth_only:
+            raise ValueError("--pose-only and --depth-only are mutually exclusive")
         if min_stitch_scale >= max_stitch_scale:
             raise ValueError("--max-stitch-scale must be greater than --min-stitch-scale")
+        dense_depth = _depth_options(
+            depth_preset,
+            dav3_model,
+            dav3_model_path,
+            depth_frame_step,
+            dav3_process_res,
+            dav3_resize_method,
+            depth_output_resolution,
+            depth_shard_size,
+        )
         thresholds = StitchThresholds(
             min_baseline=min_stitch_baseline,
             max_position_rmse=max_stitch_rmse,
@@ -158,10 +285,16 @@ def chunked_run_command(
             pipeline=pipeline,
             chunk_frames=chunk_frames,
             overlap_frames=overlap_frames,
-            map_options=_map_options(**map_kwargs),
+            map_options=_map_options(
+                default_frame_step=dense_depth.frame_step if dense_depth.frame_step > 1 else 5,
+                **map_kwargs,
+            ),
             thresholds=thresholds,
             skip_inference=skip_inference,
             skip_chunk_maps=skip_chunk_maps,
+            inference_mode="pose" if pose_only else "depth" if depth_only else "full",
+            depth_options=dense_depth,
+            depth_workers=depth_workers,
         )
     except (ValueError, FileNotFoundError, RuntimeError, NotImplementedError, subprocess.CalledProcessError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -186,7 +319,12 @@ def map_command(
         artifacts = discover_artifacts(artifact_root, artifact_name)
         for artifact in artifacts:
             destination = output_root / artifact.name
-            build_map(artifact, destination, _map_options(**map_kwargs), source_time_offset=source_time_offset)
+            build_map(
+                artifact,
+                destination,
+                _map_options(default_frame_step=5, **map_kwargs),
+                source_time_offset=source_time_offset,
+            )
             click.echo(f"Wrote {destination}")
     except (ValueError, FileNotFoundError, RuntimeError, NotImplementedError) as exc:
         raise click.ClickException(str(exc)) from exc

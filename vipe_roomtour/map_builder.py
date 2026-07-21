@@ -299,6 +299,9 @@ def build_map(
         "source_artifacts": str(artifact.root),
         "artifact_name": artifact.name,
         "map_options": asdict(options),
+        "dense_depth": (
+            json.loads(artifact.depth_metadata.read_text()) if artifact.depth_metadata.exists() else None
+        ),
         "world_to_level": level.world_to_level.tolist(),
         "level_axes_in_world": {
             "right": level.right.tolist(),

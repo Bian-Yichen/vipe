@@ -1,0 +1,62 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from vipe_roomtour.artifacts import ArtifactSet
+from vipe_roomtour.depth_options import DenseDepthOptions
+
+
+def test_presets_keep_existing_overlap() -> None:
+    preview = DenseDepthOptions.from_preset("preview")
+    balanced = DenseDepthOptions.from_preset("balanced")
+    quality = DenseDepthOptions.from_preset("quality")
+
+    assert (preview.model, preview.frame_step, preview.process_res_method) == (
+        "large",
+        5,
+        "upper_bound_resize",
+    )
+    assert (balanced.model, balanced.frame_step) == ("large", 2)
+    assert (quality.model, quality.frame_step, quality.output_resolution) == (
+        "giant",
+        1,
+        "original",
+    )
+    assert {preview.overlap_size, balanced.overlap_size, quality.overlap_size} == {3}
+
+
+def test_explicit_depth_overrides_and_sparse_indices() -> None:
+    options = DenseDepthOptions.from_preset(
+        "preview",
+        model="base",
+        frame_step=4,
+        process_res=672,
+        process_res_method="lower_bound_resize",
+        output_resolution="original",
+    )
+    assert options.expected_frame_indices(14) == [0, 4, 8, 12]
+    assert options.model == "base"
+    assert options.process_res == 672
+
+
+def test_resume_shard_must_align_with_unchanged_window_stride() -> None:
+    options = DenseDepthOptions.from_preset("quality")
+    assert options.resume_inference_ordinal(0) == 0
+    assert options.resume_inference_ordinal(490) == 483
+    with pytest.raises(ValueError, match="multiple"):
+        DenseDepthOptions.from_preset("quality", shard_size=500)
+
+
+def test_artifact_depth_config_match(tmp_path: Path) -> None:
+    options = DenseDepthOptions.from_preset("preview")
+    artifact = ArtifactSet(tmp_path, "tour")
+    artifact.rgb.parent.mkdir(parents=True)
+    artifact.depth.parent.mkdir(parents=True, exist_ok=True)
+    artifact.rgb.touch()
+    artifact.depth.touch()
+    artifact.depth_metadata.write_text(json.dumps(options.inference_config()))
+    assert artifact.depth_matches(options)
+    assert not artifact.depth_matches(DenseDepthOptions.from_preset("quality"))
