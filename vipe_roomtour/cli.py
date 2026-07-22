@@ -140,6 +140,11 @@ def main(verbose: bool) -> None:
 @click.option("--overwrite-segments", is_flag=True, help="Recreate already cut segment videos.")
 @click.option("--pose-only", is_flag=True, help="Stop after all-frame SLAM pose/intrinsics; do not load dense DAv3.")
 @click.option("--depth-only", is_flag=True, help="Require an existing SLAM checkpoint and run only dense depth/map.")
+@click.option(
+    "--loop-closure",
+    is_flag=True,
+    help="Enable appearance-retrieved, geometry-verified long-range loop closure inside each SLAM solve.",
+)
 @_common_depth_options
 @_common_map_options
 def run_command(
@@ -153,6 +158,7 @@ def run_command(
     overwrite_segments: bool,
     pose_only: bool,
     depth_only: bool,
+    loop_closure: bool,
     depth_preset: str,
     dav3_model: str | None,
     dav3_model_path: Path | None,
@@ -194,6 +200,7 @@ def run_command(
             overwrite_segments=overwrite_segments,
             inference_mode="pose" if pose_only else "depth" if depth_only else "full",
             depth_options=dense_depth,
+            loop_closure=loop_closure,
         )
     except (ValueError, FileNotFoundError, RuntimeError, NotImplementedError, subprocess.CalledProcessError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -226,6 +233,11 @@ def run_command(
 @click.option("--skip-chunk-maps", is_flag=True, help="Require and reuse chunk maps with identical map options.")
 @click.option("--pose-only", is_flag=True, help="Stitch/export all-frame poses without running dense DAv3.")
 @click.option("--depth-only", is_flag=True, help="Require existing chunk SLAM checkpoints; run depth and maps only.")
+@click.option(
+    "--loop-closure",
+    is_flag=True,
+    help="Enable long-range loop closure independently inside every chunk.",
+)
 @click.option("--depth-workers", type=click.IntRange(min=1), default=1, show_default=True, help="Parallel DAv3 workers, one per visible GPU.")
 @_common_depth_options
 @_common_map_options
@@ -244,6 +256,7 @@ def chunked_run_command(
     skip_chunk_maps: bool,
     pose_only: bool,
     depth_only: bool,
+    loop_closure: bool,
     depth_workers: int,
     depth_preset: str,
     dav3_model: str | None,
@@ -295,6 +308,7 @@ def chunked_run_command(
             inference_mode="pose" if pose_only else "depth" if depth_only else "full",
             depth_options=dense_depth,
             depth_workers=depth_workers,
+            loop_closure=loop_closure,
         )
     except (ValueError, FileNotFoundError, RuntimeError, NotImplementedError, subprocess.CalledProcessError) as exc:
         raise click.ClickException(str(exc)) from exc

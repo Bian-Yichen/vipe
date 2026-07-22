@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import json
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +54,10 @@ class ArtifactSet:
     def depth_metadata(self) -> Path:
         return self.root / "depth" / f"{self.name}_metadata.json"
 
+    @property
+    def loop_closure_report(self) -> Path:
+        return self.root / "vipe" / f"{self.name}_loop_closure.json"
+
     def validate_calibration(self) -> None:
         missing = [
             path
@@ -67,16 +72,32 @@ class ArtifactSet:
         if missing:
             raise FileNotFoundError("Missing VIPE artifacts: " + ", ".join(str(p) for p in missing))
 
-    def depth_matches(self, options: DenseDepthOptions) -> bool:
+    def slam_matches(self, loop_closure: bool) -> bool:
+        try:
+            self.validate_calibration()
+            with self.info.open("rb") as handle:
+                metadata = pickle.load(handle)
+            return bool(metadata.get("loop_closure_enabled", False)) == bool(loop_closure)
+        except (FileNotFoundError, OSError, EOFError, pickle.UnpicklingError, TypeError):
+            return False
+
+    def depth_matches(self, options: DenseDepthOptions, *, loop_closure: bool = False) -> bool:
         if not all(path.exists() for path in (self.rgb, self.depth, self.pose, self.intrinsics)):
             return False
         if not self.depth_metadata.exists():
             # Artifacts produced by the preceding streaming branch had exactly
             # the quality preset but no sidecar. Reuse those without an
             # expensive, numerically redundant DAv3 rerun.
-            return options.inference_config() == DenseDepthOptions.from_preset("quality").inference_config()
+            return (
+                not loop_closure
+                and options.inference_config()
+                == DenseDepthOptions.from_preset("quality").inference_config()
+            )
         try:
-            return json.loads(self.depth_metadata.read_text()) == options.inference_config()
+            saved = json.loads(self.depth_metadata.read_text())
+            expected = {**options.inference_config(), "slam_loop_closure": bool(loop_closure)}
+            saved.setdefault("slam_loop_closure", False)
+            return saved == expected
         except (OSError, ValueError, TypeError):
             return False
 

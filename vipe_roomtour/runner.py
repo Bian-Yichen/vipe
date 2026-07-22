@@ -34,6 +34,7 @@ def _run_vipe(
     mode: str = "full",
     depth_options: DenseDepthOptions | None = None,
     cuda_visible_device: str | None = None,
+    loop_closure: bool = False,
 ) -> None:
     command = [
         sys.executable,
@@ -49,6 +50,8 @@ def _run_vipe(
     ]
     if visualize:
         command.append("--visualize")
+    if loop_closure:
+        command.append("--loop-closure")
     if start_frame is not None:
         command.extend(["--start-frame", str(start_frame)])
     if end_frame is not None:
@@ -79,6 +82,7 @@ def run_roomtour(
     overwrite_segments: bool = False,
     inference_mode: str = "full",
     depth_options: DenseDepthOptions | None = None,
+    loop_closure: bool = False,
 ) -> dict:
     input_video = Path(input_video).resolve()
     output_root = resolve_output_path(output_root)
@@ -104,21 +108,27 @@ def run_roomtour(
         "pipeline": pipeline,
         "inference_mode": inference_mode,
         "dense_depth": depth_options.to_dict(),
+        "loop_closure": bool(loop_closure),
         "segments": [asdict(segment) for segment in segments],
         "jobs": [],
     }
     for name, video_path, source_offset in jobs:
         artifact = ArtifactSet(artifact_root, name)
         if inference_mode == "pose":
-            calibration_complete = True
-            try:
-                artifact.validate_calibration()
-            except FileNotFoundError:
-                calibration_complete = False
+            calibration_complete = artifact.slam_matches(loop_closure)
             if not calibration_complete:
                 if skip_inference:
-                    artifact.validate_calibration()
-                _run_vipe(video_path, artifact_root, pipeline, visualize_vipe, mode="pose")
+                    raise FileNotFoundError(
+                        f"Missing SLAM checkpoint matching loop_closure={loop_closure} for {name}"
+                    )
+                _run_vipe(
+                    video_path,
+                    artifact_root,
+                    pipeline,
+                    visualize_vipe,
+                    mode="pose",
+                    loop_closure=loop_closure,
+                )
             artifact.validate_calibration()
             calibration = load_calibration(artifact)
             map_dir = output_root / "maps" / name
@@ -145,9 +155,9 @@ def run_roomtour(
 
         if skip_inference:
             artifact.validate()
-            if not artifact.depth_matches(depth_options):
+            if not artifact.depth_matches(depth_options, loop_closure=loop_closure):
                 raise FileNotFoundError(f"Existing depth artifacts do not match requested config for {name}")
-        elif artifact.depth_matches(depth_options):
+        elif artifact.depth_matches(depth_options, loop_closure=loop_closure):
             logger.info("Matching complete artifacts already exist for %s; skipping inference", name)
         else:
             _run_vipe(
@@ -157,6 +167,7 @@ def run_roomtour(
                 visualize_vipe,
                 mode="depth" if inference_mode == "depth" else "full",
                 depth_options=depth_options,
+                loop_closure=loop_closure,
             )
         artifact.validate()
         map_dir = output_root / "maps" / name

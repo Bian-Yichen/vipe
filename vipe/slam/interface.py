@@ -195,6 +195,9 @@ class SLAMOutput:
     # Should be of range [0, 1]
     ba_residual: float = 0.0
 
+    # Diagnostics for optional appearance-retrieved intrachunk loop closure.
+    loop_closure_report: dict | None = None
+
     @property
     def keyframe_ids(self) -> np.ndarray:
         assert self.slam_map is not None, "SLAM map not available."
@@ -203,3 +206,4 @@ class SLAMOutput:
     def get_view_trajectory(self, view_idx: int) -> SE3:
         assert self.rig is not None, "Rig not available."
         return self.trajectory * self.rig[view_idx][None]  # type: ignore
+

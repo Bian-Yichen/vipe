@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import pickle
 from pathlib import Path
 
 import pytest
@@ -74,3 +75,29 @@ def test_artifact_depth_config_match(tmp_path: Path) -> None:
     artifact.depth_metadata.write_text(json.dumps(options.inference_config()))
     assert artifact.depth_matches(options)
     assert not artifact.depth_matches(DenseDepthOptions.from_preset("quality"))
+
+
+def test_artifacts_do_not_cross_reuse_loop_closure_variants(tmp_path: Path) -> None:
+    options = DenseDepthOptions.from_preset("preview")
+    artifact = ArtifactSet(tmp_path, "tour")
+    for path in (
+        artifact.rgb,
+        artifact.depth,
+        artifact.pose,
+        artifact.intrinsics,
+        artifact.camera_type,
+        artifact.info,
+        artifact.slam_map,
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    with artifact.info.open("wb") as handle:
+        pickle.dump({"loop_closure_enabled": True}, handle)
+    artifact.depth_metadata.write_text(
+        json.dumps({**options.inference_config(), "slam_loop_closure": True})
+    )
+
+    assert artifact.slam_matches(True)
+    assert not artifact.slam_matches(False)
+    assert artifact.depth_matches(options, loop_closure=True)
+    assert not artifact.depth_matches(options, loop_closure=False)

@@ -304,8 +304,22 @@ def _save_slam_checkpoint(artifact: io.ArtifactPath, slam_output: SLAMOutput, n_
         for frame_idx in range(n_frames):
             handle.write(f"{frame_idx}: {CameraType.PINHOLE.name}\n")
 
+    loop_report = slam_output.loop_closure_report
+    loop_enabled = loop_report is not None and bool(loop_report.get("enabled", False))
     with artifact.meta_info_path.open("wb") as handle:
-        pickle.dump({"ba_residual": slam_output.ba_residual}, handle)
+        pickle.dump(
+            {
+                "ba_residual": slam_output.ba_residual,
+                "loop_closure_enabled": loop_enabled,
+                "loop_closure_report": loop_report,
+            },
+            handle,
+        )
+    report_path = artifact.meta_info_path.parent / f"{artifact.artifact_name}_loop_closure.json"
+    if loop_report is not None:
+        report_path.write_text(json.dumps(loop_report, indent=2, sort_keys=True) + "\n")
+    else:
+        report_path.unlink(missing_ok=True)
 
     slam_map = slam_output.slam_map
     if slam_map is None:
@@ -313,7 +327,12 @@ def _save_slam_checkpoint(artifact: io.ArtifactPath, slam_output: SLAMOutput, n_
     slam_map.save(artifact.slam_map_path)
 
 
-def _load_slam_checkpoint(artifact: io.ArtifactPath, n_frames: int) -> SLAMOutput | None:
+def _load_slam_checkpoint(
+    artifact: io.ArtifactPath,
+    n_frames: int,
+    *,
+    expected_loop_closure: bool,
+) -> SLAMOutput | None:
     """Load a complete streaming checkpoint, or return ``None`` if incomplete."""
 
     paths = (artifact.pose_path, artifact.intrinsics_path, artifact.camera_type_path, artifact.slam_map_path)
@@ -329,10 +348,19 @@ def _load_slam_checkpoint(artifact: io.ArtifactPath, n_frames: int) -> SLAMOutpu
         intrinsics = torch.from_numpy(intrinsics_data["data"][0]).float().cuda()[None]
         slam_map = SLAMMap.load(artifact.slam_map_path, device=torch.device("cpu"))
         ba_residual = 0.0
+        loop_report = None
         if artifact.meta_info_path.exists():
             with artifact.meta_info_path.open("rb") as handle:
                 meta_info = pickle.load(handle)
             ba_residual = float(meta_info.get("ba_residual", 0.0))
+            saved_loop_closure = bool(meta_info.get("loop_closure_enabled", False))
+            if saved_loop_closure != bool(expected_loop_closure):
+                logger.info(
+                    "Ignoring SLAM checkpoint for %s because loop-closure mode changed",
+                    artifact.artifact_name,
+                )
+                return None
+            loop_report = meta_info.get("loop_closure_report")
         logger.info("Resuming dense-depth export from saved SLAM checkpoint for %s", artifact.artifact_name)
         return SLAMOutput(
             trajectory=trajectory,
@@ -340,6 +368,7 @@ def _load_slam_checkpoint(artifact: io.ArtifactPath, n_frames: int) -> SLAMOutpu
             rig=SE3.Identity(1).cuda(),
             slam_map=slam_map,
             ba_residual=ba_residual,
+            loop_closure_report=loop_report,
         )
     except (OSError, EOFError, pickle.UnpicklingError, ValueError, KeyError, RuntimeError) as exc:
         logger.warning("Could not load SLAM checkpoint for %s: %s", artifact.artifact_name, exc)
@@ -371,6 +400,7 @@ class StreamingRoomTourPipeline(DefaultAnnotationPipeline):
             "output_resolution": str(self.post_cfg.depth_output_resolution),
             "window_size": 10,
             "overlap_size": 3,
+            "slam_loop_closure": bool(self.slam_cfg.loop_closure.enabled),
         }
 
     def _add_post_processors(
@@ -410,7 +440,11 @@ class StreamingRoomTourPipeline(DefaultAnnotationPipeline):
         require_checkpoint: bool,
     ) -> tuple[VideoStream, SLAMOutput]:
         n_frames = len(video_data)
-        slam_output = _load_slam_checkpoint(artifact, n_frames)
+        slam_output = _load_slam_checkpoint(
+            artifact,
+            n_frames,
+            expected_loop_closure=bool(self.slam_cfg.loop_closure.enabled),
+        )
         if slam_output is None:
             if require_checkpoint:
                 raise FileNotFoundError(
@@ -472,6 +506,7 @@ class StreamingRoomTourPipeline(DefaultAnnotationPipeline):
                 "output_resolution": "original",
                 "window_size": 10,
                 "overlap_size": 3,
+                "slam_loop_closure": False,
             }
             try:
                 saved_config = json.loads(metadata_path.read_text()) if metadata_path.exists() else legacy_quality

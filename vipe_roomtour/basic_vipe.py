@@ -19,6 +19,7 @@ def build_pipeline(
     pipeline_name: str,
     save_viz: bool = False,
     depth_options: DenseDepthOptions | None = None,
+    loop_closure: bool = False,
 ):
     """Construct the bounded-memory annotation pipeline without Hydra."""
 
@@ -40,6 +41,7 @@ def build_pipeline(
     slam.optimize_intrinsics = True
     slam.keyframe_depth = keyframe_depth
     slam.visualize = False
+    slam.loop_closure.enabled = bool(loop_closure)
 
     init = OmegaConf.create(
         {
@@ -90,6 +92,7 @@ def run_inference(
     artifact_name: str | None = None,
     mode: str = "full",
     depth_options: DenseDepthOptions | None = None,
+    loop_closure: bool = False,
 ) -> None:
     """Decode one continuous video and run the minimal static-scene pipeline."""
 
@@ -117,7 +120,13 @@ def run_inference(
         RawMp4Stream(video, seek_range=seek_range, name=artifact_name),
         [],
     )
-    pipeline = build_pipeline(output, pipeline_name, save_viz=save_viz, depth_options=depth_options)
+    pipeline = build_pipeline(
+        output,
+        pipeline_name,
+        save_viz=save_viz,
+        depth_options=depth_options,
+        loop_closure=loop_closure,
+    )
     pipeline.run_mode(stream, mode=mode, frame_index_offset=0 if start_frame is None else int(start_frame))
     logger.info("Finished minimal VIPE inference")
 
@@ -137,6 +146,11 @@ def main() -> None:
     parser.add_argument("--end-frame", type=int, default=None, help="Exclusive source frame for chunked inference")
     parser.add_argument("--artifact-name", default=None, help="Override the artifact basename")
     parser.add_argument("--mode", choices=("full", "pose", "depth"), default="full")
+    parser.add_argument(
+        "--loop-closure",
+        action="store_true",
+        help="Enable geometry-verified long-range loop closure inside this SLAM solve",
+    )
     parser.add_argument("--depth-preset", choices=("preview", "balanced", "quality"), default="quality")
     parser.add_argument("--dav3-model", choices=("giant", "large", "base", "small"), default=None)
     parser.add_argument(
@@ -176,6 +190,7 @@ def main() -> None:
         artifact_name=args.artifact_name,
         mode=args.mode,
         depth_options=depth_options,
+        loop_closure=args.loop_closure,
     )
 
 

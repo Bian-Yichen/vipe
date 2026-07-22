@@ -293,8 +293,20 @@ class SLAMSystem:
         # Run the backend to perform a global BA over the keyframes.
         self.backend.run(7, log=self.visualize)
 
-        # Run backend again with a new graph and cleared GRU states.
-        self.backend.run(self.config.backend_iters, update_depth=False, log=self.visualize)
+        # Appearance retrieval is independent of the current pose, so it can
+        # recover revisits that the stock geometry-gated backend graph missed.
+        loop_edges = None
+        if self.config.loop_closure.enabled:
+            loop_edges = self.backend.detect_and_correct_loops()
+
+        # Rebuild the dense graph from corrected poses and explicitly retain
+        # verified loop pairs for the final DROID bundle adjustment.
+        self.backend.run(
+            self.config.backend_iters,
+            update_depth=False,
+            log=self.visualize,
+            extra_edges=loop_edges,
+        )
 
         # Infill poses and attributes for non-keyframe frames.
         self.inner_filler.set_start_idx(self.buffer.n_frames)
@@ -329,4 +341,6 @@ class SLAMSystem:
             intrinsics=original_intrinsics,
             rig=SE3(self.buffer.rig.clone()),
             slam_map=slam_map,
+            loop_closure_report=self.backend.last_loop_report,
         )
+

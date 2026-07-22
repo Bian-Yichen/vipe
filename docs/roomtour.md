@@ -39,7 +39,7 @@ branch of the repository:
 ```bash
 git clone https://github.com/Bian-Yichen/vipe.git
 cd vipe
-git checkout agent/roomtour-chunked-sim3
+git checkout agent/roomtour-intrachunk-loop-closure
 
 # Use the same ViPE installation method/environment you normally use.
 # Editable install exposes both commands. Hydra is not needed by vipe-roomtour.
@@ -165,10 +165,62 @@ Important outputs are:
   depth-to-global scale (and the overlap-blended scale) for every source frame.
 
 This strategy removes long-horizon drift inside one monolithic solve, but it
-cannot repair a bad pose estimate inside a 5000-frame chunk. Pairwise alignment
-also accumulates slowly over many chunks because there is no distant loop
-closure. It is most suitable when the camera continuously explores new areas,
-as in the intended villa tours.
+cannot by itself repair a bad pose estimate inside a 5000-frame chunk. The
+experimental loop-closure mode below addresses revisits inside each chunk.
+Pairwise chunk alignment can still accumulate slowly across many chunks.
+
+## Experimental intrachunk loop closure
+
+Use `--loop-closure` when the camera sees the same stair landing, doorway, or
+room again after a long delay inside one SLAM solve:
+
+```bash
+python -m vipe_roomtour.cli chunked-run /data/villa.mp4 /data/output/villa_loop \
+  --chunk-frames 5000 --overlap-frames 500 \
+  --pose-only --loop-closure
+```
+
+This keeps the stock frontend and backend, then adds four guarded steps before
+the final DROID bundle adjustment:
+
+1. Pool the DROID keyframe feature maps into appearance descriptors and retrieve
+   temporally distant candidates without using the current pose as a gate.
+2. Match SIFT features and estimate the relative SE(3) independently in both
+   directions using each keyframe's depth and calibrated intrinsics.
+3. Reject candidates that fail inlier, reprojection, bidirectional-cycle,
+   correction-size, or neighboring-pair support checks.
+4. Distribute each accepted correction through a pose graph, then insert the
+   verified pair in both directions into the final dense DROID BA.
+
+The mode is opt-in: omitting `--loop-closure` executes the previous solver.
+Loop and non-loop checkpoints/depth are tagged separately, so changing the flag
+forces the required pose/depth recomputation instead of silently mixing results.
+For an A/B test, use different output directories and compare pose-only first:
+
+```bash
+python -m vipe_roomtour.cli chunked-run /data/villa.mp4 /data/output/villa_base \
+  --chunk-frames 5000 --overlap-frames 500 --pose-only
+python -m vipe_roomtour.cli chunked-run /data/villa.mp4 /data/output/villa_loop \
+  --chunk-frames 5000 --overlap-frames 500 --pose-only --loop-closure
+```
+
+Each chunk writes
+`vipe_artifacts/vipe/CHUNK_NAME_loop_closure.json`. It records retrieved pairs,
+every rejection reason, accepted loop edges, pose-graph cost before/after, and
+maximum local/camera correction. No accepted edge is a valid outcome when the
+video has no trustworthy revisit. When continuing a loop-enabled pose-only run,
+repeat the flag:
+
+```bash
+python -m vipe_roomtour.cli chunked-run /data/villa.mp4 /data/output/villa_loop \
+  --chunk-frames 5000 --overlap-frames 500 \
+  --depth-only --depth-preset preview --loop-closure
+```
+
+This experiment targets pose drift. Rolling shutter, severe lens distortion,
+or inconsistent dense DAv3 depth can still leave wall thickness even after a
+correct loop. Repeated texture is why appearance similarity alone is never
+allowed to modify a pose.
 
 This accepts any input resolution supported by VIPE (720p, 1080p, and so on).
 VIPE writes intrinsics in the original RGB pixel grid. If dense depth uses a

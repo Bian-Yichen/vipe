@@ -26,6 +26,7 @@ from vipe.priors.depth import DepthEstimationModel
 from ..networks.droid_net import DroidNet
 from .buffer import GraphBuffer
 from .factor_graph import FactorGraph
+from .loop_closure import detect_and_correct_loops
 
 
 class SLAMBackend:
@@ -41,6 +42,7 @@ class SLAMBackend:
         self.args = args
         self.device = device
         self.last_graph: torch.Tensor | None = None
+        self.last_loop_report: dict | None = None
 
     def _iterate_with_depth(self, graph: FactorGraph, steps: int, more_iters: bool):
         steps_preintr = steps // 2
@@ -72,7 +74,13 @@ class SLAMBackend:
         )
 
     @torch.no_grad()
-    def run(self, steps: int = 12, update_depth: bool = True, log: bool = False):
+    def run(
+        self,
+        steps: int = 12,
+        update_depth: bool = True,
+        log: bool = False,
+        extra_edges: torch.Tensor | None = None,
+    ):
         """main update (reset GRU state)"""
 
         t = self.video.n_frames
@@ -92,6 +100,10 @@ class SLAMBackend:
             thresh=self.args.backend_thresh,
             beta=self.args.beta,
         )
+        if extra_edges is not None and len(extra_edges) > 0:
+            ii, jj = extra_edges.unbind(dim=-1)
+            # Dense DROID factors are directional; insert both directions.
+            graph.add_factors(torch.cat((ii, jj)), torch.cat((jj, ii)))
 
         if self.args.adaptive_cross_view:
             self.video.build_adaptive_cross_view_idx()
@@ -118,6 +130,13 @@ class SLAMBackend:
             graph.log()
 
     @torch.no_grad()
+    def detect_and_correct_loops(self) -> torch.Tensor | None:
+        edges, report = detect_and_correct_loops(self.video, self.args.loop_closure)
+        self.last_loop_report = report
+        return edges
+
+    @torch.no_grad()
     def run_if_necessary(self, steps: int = 12, log: bool = False):
         if self.args.optimize_intrinsics or self.args.optimize_rig_rotation:
             self.run(steps=steps, update_depth=True, log=log)
+

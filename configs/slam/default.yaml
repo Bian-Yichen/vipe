@@ -23,6 +23,32 @@ backend_thresh: 22.0
 backend_radius: 2
 backend_nms: 3
 backend_iters: 24
+
+# Optional intrachunk loop closure. Disabled by default so the stock solver is
+# numerically unchanged unless explicitly requested by the room-tour CLI.
+loop_closure:
+  enabled: false
+  min_frame_gap: 300
+  retrieval_top_k: 6
+  similarity_threshold: 0.52
+  spatial_similarity_threshold: 0.35
+  spatial_search_radius: 2.0
+  max_candidates: 120
+  candidate_nms: 2
+  max_features: 2048
+  ratio_test: 0.78
+  min_matches: 35
+  min_inliers: 24
+  min_inlier_ratio: 0.28
+  max_reprojection_error: 2.5
+  max_cycle_rotation_deg: 5.0
+  max_cycle_translation: 0.30
+  max_pose_correction_rotation_deg: 35.0
+  max_pose_correction_translation: 3.0
+  cluster_radius: 8
+  min_cluster_support: 2
+  max_loop_edges: 24
+  pose_graph_max_nfev: 40
 # Initial values for disparity
 init_disp: 1.0
 # Whether to optimize intrinsics
@@ -65,3 +91,4 @@ ba:
 
 sparse_tracks:
   name: dummy
+
