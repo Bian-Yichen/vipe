@@ -48,6 +48,8 @@ from vipe.utils.cameras import CameraType
 from vipe.utils.geometry import se3_matrix_to_se3
 from vipe.utils.visualization import VideoWriter
 
+from .artifacts import LOOP_CLOSURE_CACHE_VERSION
+
 logger = logging.getLogger(__name__)
 
 
@@ -306,11 +308,13 @@ def _save_slam_checkpoint(artifact: io.ArtifactPath, slam_output: SLAMOutput, n_
 
     loop_report = slam_output.loop_closure_report
     loop_enabled = loop_report is not None and bool(loop_report.get("enabled", False))
+    loop_version = int(loop_report.get("version", 0)) if loop_enabled else 0
     with artifact.meta_info_path.open("wb") as handle:
         pickle.dump(
             {
                 "ba_residual": slam_output.ba_residual,
                 "loop_closure_enabled": loop_enabled,
+                "loop_closure_version": loop_version,
                 "loop_closure_report": loop_report,
             },
             handle,
@@ -349,18 +353,25 @@ def _load_slam_checkpoint(
         slam_map = SLAMMap.load(artifact.slam_map_path, device=torch.device("cpu"))
         ba_residual = 0.0
         loop_report = None
+        saved_loop_closure = False
+        saved_loop_version = 0
         if artifact.meta_info_path.exists():
             with artifact.meta_info_path.open("rb") as handle:
                 meta_info = pickle.load(handle)
             ba_residual = float(meta_info.get("ba_residual", 0.0))
             saved_loop_closure = bool(meta_info.get("loop_closure_enabled", False))
-            if saved_loop_closure != bool(expected_loop_closure):
-                logger.info(
-                    "Ignoring SLAM checkpoint for %s because loop-closure mode changed",
-                    artifact.artifact_name,
-                )
-                return None
+            saved_loop_version = int(meta_info.get("loop_closure_version", 0))
             loop_report = meta_info.get("loop_closure_report")
+        expected_loop_version = LOOP_CLOSURE_CACHE_VERSION if expected_loop_closure else 0
+        if (
+            saved_loop_closure != bool(expected_loop_closure)
+            or saved_loop_version != expected_loop_version
+        ):
+            logger.info(
+                "Ignoring SLAM checkpoint for %s because loop-closure mode/version changed",
+                artifact.artifact_name,
+            )
+            return None
         logger.info("Resuming dense-depth export from saved SLAM checkpoint for %s", artifact.artifact_name)
         return SLAMOutput(
             trajectory=trajectory,
@@ -401,6 +412,9 @@ class StreamingRoomTourPipeline(DefaultAnnotationPipeline):
             "window_size": 10,
             "overlap_size": 3,
             "slam_loop_closure": bool(self.slam_cfg.loop_closure.enabled),
+            "slam_loop_closure_version": (
+                LOOP_CLOSURE_CACHE_VERSION if self.slam_cfg.loop_closure.enabled else 0
+            ),
         }
 
     def _add_post_processors(
@@ -507,6 +521,7 @@ class StreamingRoomTourPipeline(DefaultAnnotationPipeline):
                 "window_size": 10,
                 "overlap_size": 3,
                 "slam_loop_closure": False,
+                "slam_loop_closure_version": 0,
             }
             try:
                 saved_config = json.loads(metadata_path.read_text()) if metadata_path.exists() else legacy_quality

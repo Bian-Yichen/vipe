@@ -26,7 +26,7 @@ from vipe.priors.depth import DepthEstimationModel
 from ..networks.droid_net import DroidNet
 from .buffer import GraphBuffer
 from .factor_graph import FactorGraph
-from .loop_closure import detect_and_correct_loops
+from .loop_closure import detect_and_correct_loops, finalize_loop_report, snapshot_w2c
 
 
 class SLAMBackend:
@@ -43,6 +43,7 @@ class SLAMBackend:
         self.device = device
         self.last_graph: torch.Tensor | None = None
         self.last_loop_report: dict | None = None
+        self.loop_reference_w2c = None
 
     def _iterate_with_depth(self, graph: FactorGraph, steps: int, more_iters: bool):
         steps_preintr = steps // 2
@@ -131,12 +132,16 @@ class SLAMBackend:
 
     @torch.no_grad()
     def detect_and_correct_loops(self) -> torch.Tensor | None:
+        self.loop_reference_w2c = snapshot_w2c(self.video)
         edges, report = detect_and_correct_loops(self.video, self.args.loop_closure)
         self.last_loop_report = report
         return edges
 
     @torch.no_grad()
+    def finalize_loop_report(self) -> None:
+        finalize_loop_report(self.video, self.last_loop_report, self.loop_reference_w2c)
+
+    @torch.no_grad()
     def run_if_necessary(self, steps: int = 12, log: bool = False):
         if self.args.optimize_intrinsics or self.args.optimize_rig_rotation:
             self.run(steps=steps, update_depth=True, log=log)
-

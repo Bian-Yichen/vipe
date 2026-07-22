@@ -307,6 +307,8 @@ class SLAMSystem:
             log=self.visualize,
             extra_edges=loop_edges,
         )
+        if self.config.loop_closure.enabled:
+            self.backend.finalize_loop_report()
 
         # Infill poses and attributes for non-keyframe frames.
         self.inner_filler.set_start_idx(self.buffer.n_frames)
@@ -343,4 +345,3 @@ class SLAMSystem:
             slam_map=slam_map,
             loop_closure_report=self.backend.last_loop_report,
         )
-

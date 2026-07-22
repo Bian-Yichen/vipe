@@ -6,6 +6,7 @@ from vipe.slam.components.loop_closure import (
     LoopClosureOptions,
     LoopConstraint,
     _optimize_pose_graph_matrices,
+    _sequence_score,
     _sequence_filter,
 )
 
@@ -17,9 +18,13 @@ def _constraint(source: int, target: int, transform: np.ndarray) -> LoopConstrai
         source_frame=source * 10,
         target_frame=target * 10,
         similarity=0.9,
+        sequence_similarity=0.9,
+        sequence_direction=1,
         matches=100,
         inliers=80,
         inlier_ratio=0.8,
+        essential_inliers=80,
+        essential_rotation_error_deg=0.1,
         median_reprojection_error=0.5,
         cycle_rotation_deg=0.1,
         cycle_translation=0.01,
@@ -40,6 +45,19 @@ def test_sequence_filter_requires_neighboring_loop_pairs() -> None:
     assert {(item.source, item.target) for item in retained} == {(2, 20), (4, 22)}
 
 
+def test_sequence_score_recognizes_reverse_traversal() -> None:
+    similarities = np.zeros((12, 12), dtype=np.float32)
+    # Source sequence 2,3,4 reappears in reverse as 9,8,7.
+    similarities[2, 9] = 0.8
+    similarities[3, 8] = 0.9
+    similarities[4, 7] = 0.85
+
+    score, direction = _sequence_score(similarities, 3, 8, radius=1)
+
+    assert direction == -1
+    assert score > 0.84
+
+
 def test_pose_graph_distributes_a_verified_loop_correction() -> None:
     # A drifted trajectory ends one metre away even though frames 0 and 9
     # observe the same camera pose.  The verified identity loop should close
@@ -51,7 +69,7 @@ def test_pose_graph_distributes_a_verified_loop_correction() -> None:
     corrected, report = _optimize_pose_graph_matrices(
         original,
         [constraint],
-        LoopClosureOptions(pose_graph_max_nfev=80),
+        LoopClosureOptions(pose_graph_max_nfev=80, min_cluster_support=1),
     )
 
     old_endpoint_error = np.linalg.norm(original[9, :3, 3] - original[0, :3, 3])
@@ -59,3 +77,27 @@ def test_pose_graph_distributes_a_verified_loop_correction() -> None:
     assert report["cost_after"] < report["cost_before"]
     assert new_endpoint_error < 0.25 * old_endpoint_error
     assert report["max_local_odometry_change"] < 0.3
+
+
+def test_switchable_pose_graph_rejects_a_contradictory_loop() -> None:
+    original = np.repeat(np.eye(4)[None], 20, axis=0)
+    original[:, 0, 3] = -np.linspace(0.0, 2.0, len(original))
+    identity = np.eye(4)
+    contradictory = np.eye(4)
+    contradictory[0, 3] = 2.5
+
+    _, report = _optimize_pose_graph_matrices(
+        original,
+        [
+            _constraint(0, 19, identity),
+            _constraint(1, 18, identity),
+            _constraint(5, 15, contradictory),
+        ],
+        LoopClosureOptions(pose_graph_max_nfev=100, min_cluster_support=2),
+    )
+
+    good_a, good_b, outlier = report["robust_loop_switch_weights"]
+    assert report["applied"]
+    assert min(good_a, good_b) > 0.8
+    assert outlier < 0.1
+    assert report["robust_loop_edges_retained"] == 2

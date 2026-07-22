@@ -28,13 +28,18 @@ backend_iters: 24
 # numerically unchanged unless explicitly requested by the room-tour CLI.
 loop_closure:
   enabled: false
-  min_frame_gap: 300
-  retrieval_top_k: 6
-  similarity_threshold: 0.52
-  spatial_similarity_threshold: 0.35
-  spatial_search_radius: 2.0
-  max_candidates: 120
-  candidate_nms: 2
+  min_frame_gap: 900
+  min_keyframe_gap: 20
+  retrieval_top_k: 4
+  similarity_threshold: 0.45
+  max_candidates: 48
+  candidate_nms: 4
+  sequence_radius: 2
+  min_sequence_support: 2
+  droid_retrieval_weight: 0.35
+  vlad_words: 24
+  vlad_sample_descriptors: 12000
+  vlad_kmeans_iters: 8
   max_features: 2048
   ratio_test: 0.78
   min_matches: 35
@@ -47,8 +52,11 @@ loop_closure:
   max_pose_correction_translation: 3.0
   cluster_radius: 8
   min_cluster_support: 2
-  max_loop_edges: 24
-  pose_graph_max_nfev: 40
+  max_loop_edges: 32
+  switch_prior_weight: 25.0
+  min_switch_weight: 0.25
+  pose_graph_max_local_change: 0.35
+  pose_graph_max_nfev: 60
 # Initial values for disparity
 init_disp: 1.0
 # Whether to optimize intrinsics
@@ -91,4 +99,3 @@ ba:
 
 sparse_tracks:
   name: dummy
-

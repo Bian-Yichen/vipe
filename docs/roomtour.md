@@ -180,21 +180,35 @@ python -m vipe_roomtour.cli chunked-run /data/villa.mp4 /data/output/villa_loop 
   --pose-only --loop-closure
 ```
 
-This keeps the stock frontend and backend, then adds four guarded steps before
-the final DROID bundle adjustment:
+This keeps the stock frontend and backend, then runs loop-closure v2 before the
+final DROID bundle adjustment:
 
-1. Pool the DROID keyframe feature maps into appearance descriptors and retrieve
-   temporally distant candidates without using the current pose as a gate.
-2. Match SIFT features and estimate the relative SE(3) independently in both
-   directions using each keyframe's depth and calibrated intrinsics.
-3. Reject candidates that fail inlier, reprojection, bidirectional-cycle,
-   correction-size, or neighboring-pair support checks.
-4. Distribute each accepted correction through a pose graph, then insert the
-   verified pair in both directions into the final dense DROID BA.
+1. Build a hybrid place descriptor from the existing DROID feature pyramid and
+   a video-specific RootSIFT-VLAD vocabulary. It only retrieves pairs separated
+   by at least 900 source frames and 20 keyframes, without using the drifted
+   pose as a gate.
+2. Score five-keyframe sequences in both forward and reverse order. Reverse
+   scoring is important when the camera climbs a stair, turns around, and later
+   observes the same landing while walking in the opposite direction.
+3. Verify multiple neighboring frame pairs, not only the best-looking image.
+   Each pair must pass mutual RootSIFT matching, an essential-matrix test,
+   forward and reverse depth-PnP, reprojection, cycle, and correction-size
+   checks. At least two neighboring pairs must agree.
+4. Optimize all keyframe poses with local odometry plus the verified long-range
+   constraints. A second robust pass downweights mutually inconsistent loop
+   edges before accepted pairs are inserted in both directions into the final
+   dense DROID BA.
+5. Measure the poses again after that final BA. The report therefore shows the
+   correction that actually survives into exported per-frame poses, rather than
+   only the intermediate pose-graph result.
+
+The v2 retrieval and verification code uses OpenCV and features already present
+in ViPE; it does not download an additional neural-network checkpoint.
 
 The mode is opt-in: omitting `--loop-closure` executes the previous solver.
-Loop and non-loop checkpoints/depth are tagged separately, so changing the flag
-forces the required pose/depth recomputation instead of silently mixing results.
+Loop and non-loop checkpoints/depth are tagged separately. The algorithm
+version is tagged as well, so a directory produced by loop-closure v1 is
+automatically invalidated and recomputed by v2 instead of being silently reused.
 For an A/B test, use different output directories and compare pose-only first:
 
 ```bash
@@ -205,10 +219,12 @@ python -m vipe_roomtour.cli chunked-run /data/villa.mp4 /data/output/villa_loop 
 ```
 
 Each chunk writes
-`vipe_artifacts/vipe/CHUNK_NAME_loop_closure.json`. It records retrieved pairs,
-every rejection reason, accepted loop edges, pose-graph cost before/after, and
-maximum local/camera correction. No accepted edge is a valid outcome when the
-video has no trustworthy revisit. When continuing a loop-enabled pose-only run,
+`vipe_artifacts/vipe/CHUNK_NAME_loop_closure.json`. It records sequence direction
+and support, every per-pair rejection reason, accepted long-range edges, robust
+edge weights, exact pose-graph sanity checks, and pose-graph cost before/after.
+`final_dense_ba` reports the final camera correction and residual of every
+accepted loop after DROID BA. No accepted edge is a valid outcome when the video
+has no trustworthy revisit. When continuing a loop-enabled pose-only run,
 repeat the flag:
 
 ```bash

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
-from vipe_roomtour.artifacts import ArtifactSet
+from vipe_roomtour.artifacts import LOOP_CLOSURE_CACHE_VERSION, ArtifactSet
 from vipe_roomtour.depth_options import DenseDepthOptions
 
 
@@ -92,12 +92,35 @@ def test_artifacts_do_not_cross_reuse_loop_closure_variants(tmp_path: Path) -> N
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
     with artifact.info.open("wb") as handle:
-        pickle.dump({"loop_closure_enabled": True}, handle)
+        pickle.dump(
+            {
+                "loop_closure_enabled": True,
+                "loop_closure_version": LOOP_CLOSURE_CACHE_VERSION,
+            },
+            handle,
+        )
     artifact.depth_metadata.write_text(
-        json.dumps({**options.inference_config(), "slam_loop_closure": True})
+        json.dumps(
+            {
+                **options.inference_config(),
+                "slam_loop_closure": True,
+                "slam_loop_closure_version": LOOP_CLOSURE_CACHE_VERSION,
+            }
+        )
     )
 
     assert artifact.slam_matches(True)
     assert not artifact.slam_matches(False)
     assert artifact.depth_matches(options, loop_closure=True)
     assert not artifact.depth_matches(options, loop_closure=False)
+
+    # A v1 experiment must not silently feed its poses or dense depth into the
+    # stronger v2 algorithm, even when the command-line flag is unchanged.
+    with artifact.info.open("wb") as handle:
+        pickle.dump({"loop_closure_enabled": True, "loop_closure_version": 1}, handle)
+    old_depth_metadata = json.loads(artifact.depth_metadata.read_text())
+    old_depth_metadata["slam_loop_closure_version"] = 1
+    artifact.depth_metadata.write_text(json.dumps(old_depth_metadata))
+
+    assert not artifact.slam_matches(True)
+    assert not artifact.depth_matches(options, loop_closure=True)

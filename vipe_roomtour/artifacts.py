@@ -16,6 +16,8 @@ import numpy as np
 from .depth_options import DenseDepthOptions
 from .geometry import intrinsics_matrix
 
+LOOP_CLOSURE_CACHE_VERSION = 2
+
 
 @dataclass(frozen=True)
 class ArtifactSet:
@@ -77,7 +79,12 @@ class ArtifactSet:
             self.validate_calibration()
             with self.info.open("rb") as handle:
                 metadata = pickle.load(handle)
-            return bool(metadata.get("loop_closure_enabled", False)) == bool(loop_closure)
+            enabled_matches = bool(metadata.get("loop_closure_enabled", False)) == bool(loop_closure)
+            version_matches = (
+                not loop_closure
+                or int(metadata.get("loop_closure_version", 0)) == LOOP_CLOSURE_CACHE_VERSION
+            )
+            return enabled_matches and version_matches
         except (FileNotFoundError, OSError, EOFError, pickle.UnpicklingError, TypeError):
             return False
 
@@ -95,8 +102,13 @@ class ArtifactSet:
             )
         try:
             saved = json.loads(self.depth_metadata.read_text())
-            expected = {**options.inference_config(), "slam_loop_closure": bool(loop_closure)}
+            expected = {
+                **options.inference_config(),
+                "slam_loop_closure": bool(loop_closure),
+                "slam_loop_closure_version": LOOP_CLOSURE_CACHE_VERSION if loop_closure else 0,
+            }
             saved.setdefault("slam_loop_closure", False)
+            saved.setdefault("slam_loop_closure_version", 0)
             return saved == expected
         except (OSError, ValueError, TypeError):
             return False

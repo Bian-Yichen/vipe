@@ -32,16 +32,26 @@ from .buffer import GraphBuffer
 
 logger = logging.getLogger(__name__)
 
+LOOP_CLOSURE_VERSION = 2
+
 
 @dataclass(frozen=True)
 class LoopClosureOptions:
-    min_frame_gap: int = 300
-    retrieval_top_k: int = 6
-    similarity_threshold: float = 0.52
-    spatial_similarity_threshold: float = 0.35
-    spatial_search_radius: float = 2.0
-    max_candidates: int = 120
-    candidate_nms: int = 2
+    # Require a genuinely long revisit.  Raw-frame and keyframe gaps are both
+    # needed because a nearly stationary camera can produce very sparse
+    # keyframes over hundreds of decoded frames.
+    min_frame_gap: int = 900
+    min_keyframe_gap: int = 20
+    retrieval_top_k: int = 4
+    similarity_threshold: float = 0.45
+    max_candidates: int = 48
+    candidate_nms: int = 4
+    sequence_radius: int = 2
+    min_sequence_support: int = 2
+    droid_retrieval_weight: float = 0.35
+    vlad_words: int = 24
+    vlad_sample_descriptors: int = 12000
+    vlad_kmeans_iters: int = 8
     max_features: int = 2048
     ratio_test: float = 0.78
     min_matches: int = 35
@@ -54,8 +64,11 @@ class LoopClosureOptions:
     max_pose_correction_translation: float = 3.0
     cluster_radius: int = 8
     min_cluster_support: int = 2
-    max_loop_edges: int = 24
-    pose_graph_max_nfev: int = 40
+    max_loop_edges: int = 32
+    switch_prior_weight: float = 25.0
+    min_switch_weight: float = 0.25
+    pose_graph_max_local_change: float = 0.35
+    pose_graph_max_nfev: int = 60
 
     @classmethod
     def from_config(cls, config: Any) -> "LoopClosureOptions":
@@ -75,9 +88,13 @@ class LoopConstraint:
     source_frame: int
     target_frame: int
     similarity: float
+    sequence_similarity: float
+    sequence_direction: int
     matches: int
     inliers: int
     inlier_ratio: float
+    essential_inliers: int
+    essential_rotation_error_deg: float
     median_reprojection_error: float
     cycle_rotation_deg: float
     cycle_translation: float
@@ -88,7 +105,8 @@ class LoopConstraint:
 
     @property
     def score(self) -> float:
-        return float(self.similarity * self.inlier_ratio * min(self.inliers / 80.0, 1.0))
+        retrieval = 0.35 * self.similarity + 0.65 * self.sequence_similarity
+        return float(retrieval * self.inlier_ratio * min(self.inliers / 80.0, 1.0))
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -125,63 +143,6 @@ def _w2c_and_centers(buffer: GraphBuffer) -> tuple[np.ndarray, np.ndarray]:
     return w2c, c2w[:, :3, 3]
 
 
-def _candidate_pairs(
-    buffer: GraphBuffer,
-    options: LoopClosureOptions,
-) -> tuple[list[tuple[int, int, float, float]], dict[str, Any]]:
-    descriptors = _retrieval_descriptors(buffer)
-    similarity = descriptors @ descriptors.T
-    timestamps = buffer.tstamp[: buffer.n_frames].detach().cpu().numpy().astype(np.int64)
-    _, centers = _w2c_and_centers(buffer)
-    candidates: list[tuple[int, int, float, float]] = []
-
-    for target in range(buffer.n_frames):
-        earlier = np.arange(target, dtype=np.int64)
-        if len(earlier) == 0:
-            continue
-        temporal = timestamps[target] - timestamps[earlier] >= options.min_frame_gap
-        if not np.any(temporal):
-            continue
-        distances = np.linalg.norm(centers[earlier] - centers[target], axis=1)
-        sims = similarity[target, earlier]
-        # Deliberately do not gate appearance retrieval with the current pose.
-        # That would reproduce the stock backend's failure mode: once drift has
-        # separated a revisit, the correct loop can no longer be proposed.
-        appearance = sims >= options.similarity_threshold
-        spatial = (distances <= options.spatial_search_radius) & (
-            sims >= options.spatial_similarity_threshold
-        )
-        valid = temporal & (appearance | spatial)
-        valid_indices = np.flatnonzero(valid)
-        if len(valid_indices) == 0:
-            continue
-        order = valid_indices[np.argsort(sims[valid_indices])[::-1][: options.retrieval_top_k]]
-        candidates.extend(
-            (int(earlier[index]), target, float(sims[index]), float(distances[index]))
-            for index in order
-        )
-
-    # Pair-space NMS avoids spending SIFT/PnP time on many copies of the same
-    # revisit while retaining enough neighboring pairs for sequence support.
-    selected: list[tuple[int, int, float, float]] = []
-    for candidate in sorted(candidates, key=lambda item: item[2], reverse=True):
-        source, target = candidate[:2]
-        if any(
-            abs(source - old_source) <= options.candidate_nms
-            and abs(target - old_target) <= options.candidate_nms
-            for old_source, old_target, _, _ in selected
-        ):
-            continue
-        selected.append(candidate)
-        if len(selected) >= options.max_candidates:
-            break
-    return selected, {
-        "keyframes": int(buffer.n_frames),
-        "raw_retrieval_candidates": len(candidates),
-        "candidates_after_nms": len(selected),
-    }
-
-
 class _FeatureCache:
     def __init__(self, buffer: GraphBuffer, options: LoopClosureOptions):
         self.buffer = buffer
@@ -199,7 +160,14 @@ class _FeatureCache:
             image = self.buffer.images[index, 0].detach().float().cpu().numpy()
             image = np.clip(np.moveaxis(image, 0, -1) * 255.0, 0, 255).astype(np.uint8)
             gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-            self.features[index] = self.sift.detectAndCompute(gray, None)
+            keypoints, descriptors = self.sift.detectAndCompute(gray, None)
+            if descriptors is not None:
+                # RootSIFT is markedly more robust to illumination changes in
+                # room tours and remains compatible with Euclidean matching.
+                descriptors = descriptors.astype(np.float32, copy=False)
+                descriptors /= descriptors.sum(axis=1, keepdims=True) + 1e-7
+                descriptors = np.sqrt(descriptors)
+            self.features[index] = keypoints, descriptors
         return self.features[index]
 
     def disparity(self, index: int) -> np.ndarray:
@@ -210,6 +178,170 @@ class _FeatureCache:
         return self.disparities[index]
 
 
+def _sift_vlad_descriptors(
+    cache: _FeatureCache,
+    n_frames: int,
+    options: LoopClosureOptions,
+) -> np.ndarray:
+    """Build a video-specific RootSIFT-VLAD place descriptor.
+
+    Learning the visual words from the current video is useful for repetitive
+    interiors: wood, white walls and door frames are represented relative to
+    the appearance distribution of this particular house.
+    """
+
+    descriptors_by_frame: list[np.ndarray | None] = []
+    samples = []
+    per_frame = max(32, options.vlad_sample_descriptors // max(n_frames, 1))
+    for index in range(n_frames):
+        _, descriptors = cache.image_features(index)
+        descriptors_by_frame.append(descriptors)
+        if descriptors is None or len(descriptors) == 0:
+            continue
+        if len(descriptors) > per_frame:
+            selected = np.linspace(0, len(descriptors) - 1, per_frame, dtype=np.int64)
+            descriptors = descriptors[selected]
+        samples.append(descriptors)
+
+    dimension = 128 * options.vlad_words
+    if not samples:
+        return np.zeros((n_frames, dimension), dtype=np.float32)
+    training = np.concatenate(samples, axis=0).astype(np.float32, copy=False)
+    if len(training) > options.vlad_sample_descriptors:
+        selected = np.linspace(
+            0,
+            len(training) - 1,
+            options.vlad_sample_descriptors,
+            dtype=np.int64,
+        )
+        training = training[selected]
+    words = min(options.vlad_words, len(training))
+    cv2.setRNGSeed(0)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, options.vlad_kmeans_iters, 1e-4)
+    _, _, codebook = cv2.kmeans(
+        training,
+        words,
+        None,
+        criteria,
+        1,
+        cv2.KMEANS_PP_CENTERS,
+    )
+
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    output = np.zeros((n_frames, words * 128), dtype=np.float32)
+    for index, descriptors in enumerate(descriptors_by_frame):
+        if descriptors is None or len(descriptors) == 0:
+            continue
+        assignments = np.asarray(
+            [match.trainIdx for match in matcher.match(descriptors, codebook)],
+            dtype=np.int64,
+        )
+        residuals = np.zeros((words, 128), dtype=np.float32)
+        np.add.at(residuals, assignments, descriptors - codebook[assignments])
+        residuals /= np.linalg.norm(residuals, axis=1, keepdims=True) + 1e-7
+        vector = residuals.reshape(-1)
+        vector = np.sign(vector) * np.sqrt(np.abs(vector))
+        output[index] = vector / (np.linalg.norm(vector) + 1e-7)
+    return output
+
+
+def _sequence_score(
+    similarities: np.ndarray,
+    source: int,
+    target: int,
+    radius: int,
+) -> tuple[float, int]:
+    forward = []
+    reverse = []
+    n_frames = len(similarities)
+    for offset in range(-radius, radius + 1):
+        source_index = source + offset
+        forward_target = target + offset
+        reverse_target = target - offset
+        if 0 <= source_index < n_frames and 0 <= forward_target < n_frames:
+            forward.append(float(similarities[source_index, forward_target]))
+        if 0 <= source_index < n_frames and 0 <= reverse_target < n_frames:
+            reverse.append(float(similarities[source_index, reverse_target]))
+    forward_score = float(np.mean(forward)) if forward else -1.0
+    reverse_score = float(np.mean(reverse)) if reverse else -1.0
+    return (forward_score, 1) if forward_score >= reverse_score else (reverse_score, -1)
+
+
+def _advanced_candidate_pairs(
+    buffer: GraphBuffer,
+    cache: _FeatureCache,
+    options: LoopClosureOptions,
+) -> tuple[list[tuple[int, int, float, float, int, float]], dict[str, Any]]:
+    """Retrieve long sequence-level loop seeds, independent of current pose."""
+
+    droid = _retrieval_descriptors(buffer)
+    vlad = _sift_vlad_descriptors(cache, buffer.n_frames, options)
+    droid_similarity = droid @ droid.T
+    vlad_similarity = vlad @ vlad.T
+    similarities = (
+        options.droid_retrieval_weight * droid_similarity
+        + (1.0 - options.droid_retrieval_weight) * vlad_similarity
+    )
+    timestamps = buffer.tstamp[: buffer.n_frames].detach().cpu().numpy().astype(np.int64)
+    _, centers = _w2c_and_centers(buffer)
+    candidates: list[tuple[int, int, float, float, int, float]] = []
+
+    for target in range(buffer.n_frames):
+        target_candidates = []
+        for source in range(target):
+            if target - source < options.min_keyframe_gap:
+                continue
+            if timestamps[target] - timestamps[source] < options.min_frame_gap:
+                continue
+            sequence_similarity, direction = _sequence_score(
+                similarities,
+                source,
+                target,
+                options.sequence_radius,
+            )
+            if sequence_similarity < options.similarity_threshold:
+                continue
+            pose_distance = float(np.linalg.norm(centers[source] - centers[target]))
+            target_candidates.append(
+                (
+                    source,
+                    target,
+                    float(similarities[source, target]),
+                    sequence_similarity,
+                    direction,
+                    pose_distance,
+                )
+            )
+        target_candidates.sort(key=lambda item: item[3], reverse=True)
+        candidates.extend(target_candidates[: options.retrieval_top_k])
+
+    selected: list[tuple[int, int, float, float, int, float]] = []
+    for candidate in sorted(candidates, key=lambda item: item[3], reverse=True):
+        source, target = candidate[:2]
+        if any(
+            abs(source - old_source) <= options.candidate_nms
+            and abs(target - old_target) <= options.candidate_nms
+            for old_source, old_target, *_ in selected
+        ):
+            continue
+        selected.append(candidate)
+        if len(selected) >= options.max_candidates:
+            break
+    droid_weight = options.droid_retrieval_weight
+    return selected, {
+        "version": LOOP_CLOSURE_VERSION,
+        "keyframes": int(buffer.n_frames),
+        "raw_long_sequence_candidates": len(candidates),
+        "candidates_after_nms": len(selected),
+        "retrieval_descriptor": (
+            f"{droid_weight:.2f} DROID spatial pyramid + "
+            f"{1.0 - droid_weight:.2f} video-specific RootSIFT-VLAD"
+        ),
+        "minimum_raw_frame_gap": options.min_frame_gap,
+        "minimum_keyframe_gap": options.min_keyframe_gap,
+    }
+
+
 def _mutual_ratio_matches(
     desc_a: np.ndarray | None,
     desc_b: np.ndarray | None,
@@ -217,7 +349,10 @@ def _mutual_ratio_matches(
 ) -> list[cv2.DMatch]:
     if desc_a is None or desc_b is None or len(desc_a) < 2 or len(desc_b) < 2:
         return []
-    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    matcher = cv2.FlannBasedMatcher(
+        {"algorithm": 1, "trees": 5},
+        {"checks": 64},
+    )
 
     def filtered(query: np.ndarray, train: np.ndarray) -> dict[int, cv2.DMatch]:
         result = {}
@@ -315,6 +450,8 @@ def _verify_candidate(
     source: int,
     target: int,
     similarity: float,
+    sequence_similarity: float,
+    sequence_direction: int,
     cache: _FeatureCache,
     K: np.ndarray,
     timestamps: np.ndarray,
@@ -329,6 +466,33 @@ def _verify_candidate(
     source_pixels = np.asarray([kp_source[m.queryIdx].pt for m in matches], dtype=np.float64)
     target_pixels = np.asarray([kp_target[m.trainIdx].pt for m in matches], dtype=np.float64)
 
+    try:
+        essential, essential_mask = cv2.findEssentialMat(
+            source_pixels,
+            target_pixels,
+            K,
+            method=getattr(cv2, "USAC_MAGSAC", cv2.RANSAC),
+            prob=0.999,
+            threshold=1.5,
+        )
+        if essential is None or essential_mask is None:
+            return None, "essential_failed"
+        essential = essential[:3]
+        _, essential_rotation, _, recovered_mask = cv2.recoverPose(
+            essential,
+            source_pixels,
+            target_pixels,
+            K,
+            mask=essential_mask,
+        )
+    except cv2.error:
+        return None, "essential_failed"
+    if recovered_mask is None:
+        return None, "essential_failed"
+    essential_inliers = int((recovered_mask > 0).sum())
+    if essential_inliers < options.min_inliers:
+        return None, "too_few_essential_inliers"
+
     forward = _pnp(source_pixels, target_pixels, cache.disparity(source), K, options)
     reverse = _pnp(target_pixels, source_pixels, cache.disparity(target), K, options)
     if forward is None or reverse is None:
@@ -340,10 +504,23 @@ def _verify_candidate(
     if inlier_count < options.min_inliers or inlier_ratio < options.min_inlier_ratio:
         return None, "low_inlier_ratio"
 
+    essential_rotation_error = float(
+        np.degrees(
+            Rotation.from_matrix(
+                essential_rotation @ target_from_source[:3, :3].T
+            ).magnitude()
+        )
+    )
+    if essential_rotation_error > options.max_cycle_rotation_deg:
+        return None, "essential_pnp_rotation_inconsistency"
+
     cycle = source_from_target @ target_from_source
     cycle_rotation = _rotation_degrees(cycle)
     cycle_translation = float(np.linalg.norm(cycle[:3, 3]))
-    if cycle_rotation > options.max_cycle_rotation_deg or cycle_translation > options.max_cycle_translation:
+    if (
+        cycle_rotation > options.max_cycle_rotation_deg
+        or cycle_translation > options.max_cycle_translation
+    ):
         return None, "bidirectional_inconsistency"
 
     current = w2c[target] @ np.linalg.inv(w2c[source])
@@ -363,9 +540,13 @@ def _verify_candidate(
             source_frame=int(timestamps[source]),
             target_frame=int(timestamps[target]),
             similarity=similarity,
+            sequence_similarity=sequence_similarity,
+            sequence_direction=sequence_direction,
             matches=len(matches),
             inliers=inlier_count,
             inlier_ratio=float(inlier_ratio),
+            essential_inliers=essential_inliers,
+            essential_rotation_error_deg=essential_rotation_error,
             median_reprojection_error=reprojection,
             cycle_rotation_deg=cycle_rotation,
             cycle_translation=cycle_translation,
@@ -416,6 +597,7 @@ def _optimize_pose_graph_matrices(
     n = len(original)
     if n < 2:
         return original.copy(), {
+            "applied": False,
             "optimizer_success": True,
             "optimizer_status": 0,
             "optimizer_message": "Only one keyframe",
@@ -427,22 +609,25 @@ def _optimize_pose_graph_matrices(
             "median_local_odometry_change": 0.0,
             "max_local_odometry_change": 0.0,
         }
-    initial = np.concatenate([_vector_from_matrix(original[index]) for index in range(1, n)])
-    edges: list[tuple[int, int, np.ndarray, float, str]] = []
+    pose_size = 6 * (n - 1)
+    initial_poses = np.concatenate(
+        [_vector_from_matrix(original[index]) for index in range(1, n)]
+    )
+    odometry_edges: list[tuple[int, int, np.ndarray, float]] = []
     for step, weight in ((1, 1.0), (2, 0.5), (4, 0.25)):
         for source in range(0, n - step):
             target = source + step
             measurement = original[target] @ np.linalg.inv(original[source])
-            edges.append((source, target, measurement, weight, "odometry"))
+            odometry_edges.append((source, target, measurement, weight))
+    loop_edges: list[tuple[int, int, np.ndarray, float]] = []
     for constraint in constraints:
         confidence = min(constraint.inliers / 80.0, 1.0) * constraint.inlier_ratio
-        edges.append(
+        loop_edges.append(
             (
                 constraint.source,
                 constraint.target,
                 constraint.target_from_source,
                 8.0 + 12.0 * confidence,
-                "loop",
             )
         )
 
@@ -451,34 +636,103 @@ def _optimize_pose_graph_matrices(
             _matrix_from_vector(vector[6 * (index - 1) : 6 * index]) for index in range(1, n)
         ]
 
-    def residual(vector: np.ndarray) -> np.ndarray:
-        poses = unpack(vector)
+    def edge_error(
+        poses: list[np.ndarray], source: int, target: int, measurement: np.ndarray
+    ) -> np.ndarray:
+        predicted = poses[target] @ np.linalg.inv(poses[source])
+        error = np.linalg.inv(measurement) @ predicted
+        return np.concatenate(
+            (
+                Rotation.from_matrix(error[:3, :3]).as_rotvec() / 0.05,
+                error[:3, 3] / 0.10,
+            )
+        )
+
+    # First solve jointly estimates one switch variable per loop constraint.
+    # A bad loop can therefore turn itself off by paying a bounded prior cost,
+    # instead of forcing the trajectory to tear in order to satisfy it.
+    def switchable_residual(vector: np.ndarray) -> np.ndarray:
+        poses = unpack(vector[:pose_size])
+        switches = vector[pose_size:]
         values = []
-        for source, target, measurement, weight, _ in edges:
-            predicted = poses[target] @ np.linalg.inv(poses[source])
-            error = np.linalg.inv(measurement) @ predicted
-            scale = np.sqrt(weight)
-            values.extend((Rotation.from_matrix(error[:3, :3]).as_rotvec() / 0.05 * scale).tolist())
-            values.extend((error[:3, 3] / 0.10 * scale).tolist())
+        for source, target, measurement, weight in odometry_edges:
+            values.extend((edge_error(poses, source, target, measurement) * np.sqrt(weight)).tolist())
+        for loop_index, (source, target, measurement, weight) in enumerate(loop_edges):
+            values.extend(
+                (
+                    edge_error(poses, source, target, measurement)
+                    * np.sqrt(weight)
+                    * switches[loop_index]
+                ).tolist()
+            )
+        values.extend(
+            (
+                np.sqrt(options.switch_prior_weight) * (1.0 - switches)
+            ).tolist()
+        )
         return np.asarray(values, dtype=np.float64)
 
-    sparsity = lil_matrix((6 * len(edges), 6 * (n - 1)), dtype=np.int8)
-    for edge_index, (source, target, _, _, _) in enumerate(edges):
+    switchable_rows = 6 * (len(odometry_edges) + len(loop_edges)) + len(loop_edges)
+    switchable_sparsity = lil_matrix(
+        (switchable_rows, pose_size + len(loop_edges)), dtype=np.int8
+    )
+    all_edges = odometry_edges + loop_edges
+    for edge_index, (source, target, _, _) in enumerate(all_edges):
         rows = slice(6 * edge_index, 6 * edge_index + 6)
         if source > 0:
-            sparsity[rows, 6 * (source - 1) : 6 * source] = 1
+            switchable_sparsity[rows, 6 * (source - 1) : 6 * source] = 1
         if target > 0:
-            sparsity[rows, 6 * (target - 1) : 6 * target] = 1
+            switchable_sparsity[rows, 6 * (target - 1) : 6 * target] = 1
+        if edge_index >= len(odometry_edges):
+            loop_index = edge_index - len(odometry_edges)
+            switchable_sparsity[rows, pose_size + loop_index] = 1
+    prior_start = 6 * len(all_edges)
+    for loop_index in range(len(loop_edges)):
+        switchable_sparsity[prior_start + loop_index, pose_size + loop_index] = 1
 
-    before = residual(initial)
-    result = least_squares(
-        residual,
-        initial,
-        jac_sparsity=sparsity.tocsr(),
+    switchable_initial = np.concatenate((initial_poses, np.ones(len(loop_edges))))
+    lower = np.concatenate((np.full(pose_size, -np.inf), np.zeros(len(loop_edges))))
+    upper = np.concatenate((np.full(pose_size, np.inf), np.ones(len(loop_edges))))
+    first_result = least_squares(
+        switchable_residual,
+        switchable_initial,
+        jac_sparsity=switchable_sparsity.tocsr(),
         method="trf",
-        # Loop edges have already passed strict geometric verification.  A
-        # global robust loss can otherwise sacrifice one odometry edge and
-        # create a pose discontinuity instead of distributing loop drift.
+        bounds=(lower, upper),
+        loss="linear",
+        f_scale=1.0,
+        x_scale="jac",
+        max_nfev=options.pose_graph_max_nfev,
+        verbose=0,
+    )
+    switch_weights = np.clip(first_result.x[pose_size:], 0.0, 1.0)
+    retained_indices = np.flatnonzero(switch_weights >= options.min_switch_weight)
+    retained_loops = [loop_edges[index] for index in retained_indices]
+
+    def fixed_residual(vector: np.ndarray) -> np.ndarray:
+        poses = unpack(vector)
+        values = []
+        for source, target, measurement, weight in odometry_edges + retained_loops:
+            values.extend(
+                (edge_error(poses, source, target, measurement) * np.sqrt(weight)).tolist()
+            )
+        return np.asarray(values, dtype=np.float64)
+
+    fixed_edges = odometry_edges + retained_loops
+    fixed_sparsity = lil_matrix((6 * len(fixed_edges), pose_size), dtype=np.int8)
+    for edge_index, (source, target, _, _) in enumerate(fixed_edges):
+        rows = slice(6 * edge_index, 6 * edge_index + 6)
+        if source > 0:
+            fixed_sparsity[rows, 6 * (source - 1) : 6 * source] = 1
+        if target > 0:
+            fixed_sparsity[rows, 6 * (target - 1) : 6 * target] = 1
+
+    before = fixed_residual(initial_poses)
+    result = least_squares(
+        fixed_residual,
+        first_result.x[:pose_size],
+        jac_sparsity=fixed_sparsity.tocsr(),
+        method="trf",
         loss="linear",
         f_scale=1.0,
         x_scale="jac",
@@ -486,7 +740,7 @@ def _optimize_pose_graph_matrices(
         verbose=0,
     )
     corrected = np.stack(unpack(result.x))
-    after = residual(result.x)
+    after = fixed_residual(result.x)
     original_centers = np.linalg.inv(original)[:, :3, 3]
     corrected_centers = np.linalg.inv(corrected)[:, :3, 3]
     center_correction = np.linalg.norm(corrected_centers - original_centers, axis=1)
@@ -496,22 +750,28 @@ def _optimize_pose_graph_matrices(
         new_relative = corrected[source + 1] @ np.linalg.inv(corrected[source])
         delta = np.linalg.inv(old_relative) @ new_relative
         local_changes.append(
-            np.linalg.norm(delta[:3, 3]) + 0.1 * np.linalg.norm(Rotation.from_matrix(delta[:3, :3]).as_rotvec())
+            np.linalg.norm(delta[:3, 3])
+            + 0.1 * np.linalg.norm(Rotation.from_matrix(delta[:3, :3]).as_rotvec())
         )
 
     cost_before = float(0.5 * np.dot(before, before))
     cost_after = float(0.5 * np.dot(after, after))
 
-    if (
-        not result.success
-        or not np.all(np.isfinite(corrected))
-        or cost_after >= cost_before
-        or float(np.max(center_correction)) > 5.0
-        or float(np.max(local_changes, initial=0.0)) > 0.75
-    ):
-        raise RuntimeError("Loop pose-graph correction failed sanity checks")
-    return corrected, {
-        "applied": True,
+    finite = bool(np.all(np.isfinite(corrected)))
+    max_center_correction = float(np.max(center_correction))
+    max_local_change = float(np.max(local_changes, initial=0.0))
+    checks = {
+        "finite": finite,
+        "cost_decreased": cost_after < cost_before,
+        "max_camera_center_correction_below_5m": max_center_correction <= 5.0,
+        "max_local_odometry_change_within_limit": max_local_change
+        <= options.pose_graph_max_local_change,
+        "enough_robust_loop_edges": len(retained_indices)
+        >= options.min_cluster_support,
+    }
+    applied = all(checks.values())
+    report = {
+        "applied": applied,
         "optimizer_success": bool(result.success),
         "optimizer_status": int(result.status),
         "optimizer_message": str(result.message),
@@ -519,10 +779,23 @@ def _optimize_pose_graph_matrices(
         "cost_before": cost_before,
         "cost_after": cost_after,
         "median_camera_center_correction": float(np.median(center_correction)),
-        "max_camera_center_correction": float(np.max(center_correction)),
+        "max_camera_center_correction": max_center_correction,
         "median_local_odometry_change": float(np.median(local_changes)),
-        "max_local_odometry_change": float(np.max(local_changes, initial=0.0)),
+        "max_local_odometry_change": max_local_change,
+        "sanity_checks": checks,
+        "rejection_reasons": [name for name, passed in checks.items() if not passed],
+        "switchable_optimizer_success": bool(first_result.success),
+        "switchable_optimizer_status": int(first_result.status),
+        "switchable_optimizer_message": str(first_result.message),
+        "switchable_function_evaluations": int(first_result.nfev),
+        "robust_loop_switch_weights": switch_weights.tolist(),
+        "robust_loop_edges_retained": int(len(retained_indices)),
     }
+    # Hitting max_nfev is not itself a rejection: a finite, lower-cost and
+    # locally smooth solution is safe to use and the final dense BA will refine
+    # it.  This avoids discarding useful large graphs only because SciPy did not
+    # satisfy its formal termination tolerance in time.
+    return (corrected if applied else original.copy()), report
 
 
 def _pose_graph_optimize(
@@ -532,9 +805,10 @@ def _pose_graph_optimize(
 ) -> dict[str, Any]:
     original, _ = _w2c_and_centers(buffer)
     corrected, report = _optimize_pose_graph_matrices(original, constraints, options)
-    corrected_se3 = se3_matrix_to_se3(corrected.astype(np.float32)).data.to(buffer.device)
-    buffer.poses[: buffer.n_frames] = corrected_se3
-    buffer.dirty[: buffer.n_frames] = True
+    if report["applied"]:
+        corrected_se3 = se3_matrix_to_se3(corrected.astype(np.float32)).data.to(buffer.device)
+        buffer.poses[: buffer.n_frames] = corrected_se3
+        buffer.dirty[: buffer.n_frames] = True
     return report
 
 
@@ -544,76 +818,203 @@ def detect_and_correct_loops(
     config: Any,
 ) -> tuple[torch.Tensor | None, dict[str, Any]]:
     options = LoopClosureOptions.from_config(config)
-    candidates, retrieval_report = _candidate_pairs(buffer, options)
     timestamps = buffer.tstamp[: buffer.n_frames].detach().cpu().numpy().astype(np.int64)
     w2c, _ = _w2c_and_centers(buffer)
     K = buffer.K[0].astype(np.float64)
     cache = _FeatureCache(buffer, options)
-    verified = []
+    candidates, retrieval_report = _advanced_candidate_pairs(buffer, cache, options)
+    verified_by_pair: dict[tuple[int, int], LoopConstraint] = {}
+    pair_cache: dict[tuple[int, int], tuple[LoopConstraint | None, str]] = {}
     rejections: Counter[str] = Counter()
     candidate_records = []
-    for source, target, similarity, pose_distance in candidates:
-        try:
-            constraint, reason = _verify_candidate(
-                source,
-                target,
-                similarity,
-                cache,
-                K,
-                timestamps,
-                w2c,
-                options,
-            )
-        except (cv2.error, ValueError, np.linalg.LinAlgError) as exc:
-            logger.debug("Rejected loop candidate %d -> %d: %s", source, target, exc)
-            constraint, reason = None, "verification_exception"
-        rejections[reason] += 1
+    for source, target, similarity, sequence_similarity, direction, pose_distance in candidates:
+        sequence_constraints = []
+        pair_records = []
+        for offset in range(-options.sequence_radius, options.sequence_radius + 1):
+            pair_source = source + offset
+            pair_target = target + direction * offset
+            if not (0 <= pair_source < buffer.n_frames and 0 <= pair_target < buffer.n_frames):
+                continue
+            if pair_target <= pair_source or pair_target - pair_source < options.min_keyframe_gap:
+                continue
+            if timestamps[pair_target] - timestamps[pair_source] < options.min_frame_gap:
+                continue
+            pair = (pair_source, pair_target)
+            if pair not in pair_cache:
+                try:
+                    pair_cache[pair] = _verify_candidate(
+                        pair_source,
+                        pair_target,
+                        similarity,
+                        sequence_similarity,
+                        direction,
+                        cache,
+                        K,
+                        timestamps,
+                        w2c,
+                        options,
+                    )
+                except (cv2.error, ValueError, np.linalg.LinAlgError) as exc:
+                    logger.debug("Rejected loop pair %d -> %d: %s", pair_source, pair_target, exc)
+                    pair_cache[pair] = None, "verification_exception"
+            constraint, reason = pair_cache[pair]
+            rejections[reason] += 1
+            pair_record: dict[str, Any] = {
+                "source_keyframe": pair_source,
+                "target_keyframe": pair_target,
+                "source_frame": int(timestamps[pair_source]),
+                "target_frame": int(timestamps[pair_target]),
+                "offset": offset,
+                "result": reason,
+            }
+            if constraint is not None:
+                sequence_constraints.append(constraint)
+                pair_record.update(constraint.to_dict())
+            pair_records.append(pair_record)
+
+        support = len(sequence_constraints)
+        seed_result = (
+            "accepted_sequence"
+            if support >= options.min_sequence_support
+            else "insufficient_sequence_support"
+        )
+        if support >= options.min_sequence_support:
+            for constraint in sequence_constraints:
+                constraint.cluster_support = max(constraint.cluster_support, support)
+                pair = (constraint.source, constraint.target)
+                previous = verified_by_pair.get(pair)
+                if previous is None or constraint.score > previous.score:
+                    verified_by_pair[pair] = constraint
+        else:
+            rejections[seed_result] += 1
+
         record: dict[str, Any] = {
             "source_keyframe": source,
             "target_keyframe": target,
             "source_frame": int(timestamps[source]),
             "target_frame": int(timestamps[target]),
             "similarity": similarity,
+            "sequence_similarity": sequence_similarity,
+            "sequence_direction": direction,
             "current_camera_distance": pose_distance,
-            "result": reason,
+            "verified_sequence_support": support,
+            "result": seed_result,
+            "pairs": pair_records,
         }
-        if constraint is not None:
-            verified.append(constraint)
-            record.update(constraint.to_dict())
         candidate_records.append(record)
 
+    verified = list(verified_by_pair.values())
     retained = _sequence_filter(verified, options)
     report: dict[str, Any] = {
+        "version": LOOP_CLOSURE_VERSION,
         "enabled": True,
         "options": asdict(options),
         "retrieval": retrieval_report,
         "verification_counts": dict(rejections),
-        "verified_before_sequence_filter": len(verified),
+        "verified_long_pairs_before_filter": len(verified),
         "accepted_loop_edges": len(retained),
         "accepted": [constraint.to_dict() for constraint in retained],
+        "pose_graph_input_edges": [constraint.to_dict() for constraint in retained],
         "candidates": candidate_records,
         "pose_graph": None,
     }
     if not retained:
-        logger.warning("Loop closure found no geometrically verified long-range edge")
+        logger.warning("Loop closure v2 found no sequence-supported long-range edge")
         return None, report
 
-    try:
-        report["pose_graph"] = _pose_graph_optimize(buffer, retained, options)
-    except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
-        report["pose_graph"] = {"applied": False, "error": str(exc)}
-        logger.warning("Rejected loop pose-graph correction: %s", exc)
+    report["pose_graph"] = _pose_graph_optimize(buffer, retained, options)
+    switch_weights = report["pose_graph"]["robust_loop_switch_weights"]
+    minimum_switch = options.min_switch_weight
+    for record, switch_weight in zip(
+        report["pose_graph_input_edges"], switch_weights, strict=True
+    ):
+        record["robust_switch_weight"] = float(switch_weight)
+        record["retained_after_switchable_optimization"] = bool(
+            switch_weight >= minimum_switch
+        )
+    if not report["pose_graph"]["applied"]:
+        logger.warning(
+            "Rejected loop pose-graph correction: %s",
+            ", ".join(report["pose_graph"]["rejection_reasons"]),
+        )
+        return None, report
+    robust_pairs = [
+        (constraint, float(switch_weight))
+        for constraint, switch_weight in zip(retained, switch_weights, strict=True)
+        if switch_weight >= minimum_switch
+    ]
+    robust_retained = [constraint for constraint, _ in robust_pairs]
+    report["pose_graph_downweighted_edges"] = len(retained) - len(robust_retained)
+    report["accepted_loop_edges"] = len(robust_retained)
+    report["accepted"] = []
+    for constraint, switch_weight in robust_pairs:
+        record = constraint.to_dict()
+        record["robust_switch_weight"] = switch_weight
+        report["accepted"].append(record)
+    if not robust_retained:
+        logger.warning("Loop pose graph downweighted every long-range edge")
         return None, report
     edges = torch.tensor(
-        [[constraint.source, constraint.target] for constraint in retained],
+        [[constraint.source, constraint.target] for constraint in robust_retained],
         dtype=torch.long,
         device=buffer.device,
     )
     logger.info(
         "Loop closure accepted %d/%d candidates; pose graph cost %.3f -> %.3f",
-        len(retained),
+        len(robust_retained),
         len(candidates),
         report["pose_graph"]["cost_before"],
         report["pose_graph"]["cost_after"],
     )
     return edges, report
+
+
+def snapshot_w2c(buffer: GraphBuffer) -> np.ndarray:
+    return _w2c_and_centers(buffer)[0].copy()
+
+
+def finalize_loop_report(
+    buffer: GraphBuffer,
+    report: dict[str, Any] | None,
+    reference_w2c: np.ndarray | None,
+) -> None:
+    """Measure what remains after the final recurrent DROID bundle adjustment."""
+
+    if report is None or reference_w2c is None:
+        return
+    final_w2c, _ = _w2c_and_centers(buffer)
+    reference_centers = np.linalg.inv(reference_w2c)[:, :3, 3]
+    final_centers = np.linalg.inv(final_w2c)[:, :3, 3]
+    center_changes = np.linalg.norm(final_centers - reference_centers, axis=1)
+    rotation_errors = []
+    translation_errors = []
+    for constraint in report.get("accepted", []):
+        source = int(constraint["source"])
+        target = int(constraint["target"])
+        measurement = np.asarray(constraint["target_from_source"], dtype=np.float64)
+        predicted = final_w2c[target] @ np.linalg.inv(final_w2c[source])
+        error = np.linalg.inv(measurement) @ predicted
+        rotation_error = _rotation_degrees(error)
+        translation_error = float(np.linalg.norm(error[:3, 3]))
+        constraint["final_ba_rotation_error_deg"] = rotation_error
+        constraint["final_ba_translation_error"] = translation_error
+        rotation_errors.append(rotation_error)
+        translation_errors.append(translation_error)
+
+    report["final_dense_ba"] = {
+        "measured": True,
+        "median_camera_center_change_from_preloop": float(np.median(center_changes)),
+        "max_camera_center_change_from_preloop": float(np.max(center_changes, initial=0.0)),
+        "median_accepted_loop_rotation_error_deg": float(np.median(rotation_errors))
+        if rotation_errors
+        else None,
+        "max_accepted_loop_rotation_error_deg": float(np.max(rotation_errors, initial=0.0))
+        if rotation_errors
+        else None,
+        "median_accepted_loop_translation_error": float(np.median(translation_errors))
+        if translation_errors
+        else None,
+        "max_accepted_loop_translation_error": float(np.max(translation_errors, initial=0.0))
+        if translation_errors
+        else None,
+    }
