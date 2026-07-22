@@ -139,7 +139,11 @@ def main() -> None:
     parser.add_argument("--mode", choices=("full", "pose", "depth"), default="full")
     parser.add_argument("--depth-preset", choices=("preview", "balanced", "quality"), default="quality")
     parser.add_argument("--dav3-model", choices=("giant", "large", "base", "small"), default=None)
-    parser.add_argument("--dav3-model-path", default=None, help="Local checkpoint directory or Hugging Face id")
+    parser.add_argument(
+        "--dav3-model-path",
+        default=None,
+        help="Local model.safetensors file or directory containing it",
+    )
     parser.add_argument("--depth-frame-step", type=int, default=None)
     parser.add_argument("--dav3-process-res", type=int, default=None)
     parser.add_argument(

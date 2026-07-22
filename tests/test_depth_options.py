@@ -28,6 +28,14 @@ def test_presets_keep_existing_overlap() -> None:
     assert {preview.overlap_size, balanced.overlap_size, quality.overlap_size} == {3}
 
 
+def test_all_advertised_dav3_architecture_configs_are_vendored() -> None:
+    config_dir = Path(__file__).parents[1] / "vipe" / "priors" / "depth" / "dav3" / "configs"
+    for model in ("giant", "large", "base", "small"):
+        config = config_dir / f"da3-{model}.yaml"
+        assert config.is_file(), f"Missing DAv3 architecture config: {config}"
+        assert "path: vipe.priors.depth.dav3.model" in config.read_text()
+
+
 def test_explicit_depth_overrides_and_sparse_indices() -> None:
     options = DenseDepthOptions.from_preset(
         "preview",

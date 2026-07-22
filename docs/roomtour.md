@@ -69,8 +69,9 @@ top-down PNG files for QA instead.
 ViPE downloads model weights on first use. The `roomtour_dav3` pipeline uses
 Depth Anything 3 and is the recommended high-quality setting. Review the
 third-party model licenses described by upstream VIPE before large-scale use.
-`quality` uses DA3-GIANT as before. `preview` and `balanced` use DA3-LARGE, so
-that checkpoint must also be downloaded/cached before an offline compute job.
+`quality` uses DA3-GIANT as before. `preview` and `balanced` use the
+pose-conditioned multi-view DA3-LARGE model (not DA3METRIC-LARGE), so that
+checkpoint must also be downloaded/cached before an offline compute job.
 
 ## Run one complete video
 
@@ -191,6 +192,11 @@ Individual preset values can be overridden with `--dav3-model`,
 `--dav3-model-path`, `--dav3-process-res`, `--dav3-resize-method`, and
 `--depth-output-resolution`. The 3-frame overlap is intentionally not exposed
 as a tuning option.
+
+For offline nodes, `--dav3-model-path` accepts either the downloaded
+`model.safetensors` itself or a directory containing that exact filename. The
+matching architecture configuration for DA3-GIANT/LARGE/BASE/SMALL is vendored
+with ViPE, so loading a local weight file does not contact Hugging Face.
 
 Completed depth shards are kept under `depth/NAME.zip.parts/` after an
 interrupted job. Rerunning the identical command resumes from the last complete

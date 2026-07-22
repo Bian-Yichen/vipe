@@ -16,6 +16,7 @@
 
 import logging
 import os
+from pathlib import Path
 from typing import Any, Iterable, Iterator, cast
 
 import numpy as np
@@ -439,8 +440,22 @@ class MultiviewDepthProcessor(StreamProcessor):
             if dav3_model not in checkpoints:
                 raise ValueError(f"Unsupported DAv3 model: {dav3_model}")
             checkpoint, model_name = checkpoints[dav3_model]
-            checkpoint = dav3_model_path or checkpoint
-            self.dav3_api = DepthAnything3.from_pretrained(checkpoint, model_name=model_name)
+            weights_path = None
+            if dav3_model_path is not None:
+                local_checkpoint = Path(dav3_model_path).expanduser()
+                if local_checkpoint.is_dir():
+                    local_checkpoint = local_checkpoint / "model.safetensors"
+                if not local_checkpoint.is_file():
+                    raise FileNotFoundError(
+                        "Local DAv3 checkpoint must be a model.safetensors file or a directory "
+                        f"containing it: {dav3_model_path}"
+                    )
+                weights_path = str(local_checkpoint)
+            self.dav3_api = DepthAnything3.from_pretrained(
+                checkpoint,
+                model_name=model_name,
+                weights_path=weights_path,
+            )
             self.dav3_api = self.dav3_api.cuda().eval()
 
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:

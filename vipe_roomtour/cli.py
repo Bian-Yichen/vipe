@@ -60,7 +60,7 @@ def _common_depth_options(function):
             "--dav3-model-path",
             type=click.Path(exists=True, path_type=Path),
             default=None,
-            help="Local DAv3 checkpoint directory (useful on offline compute nodes).",
+            help="Local model.safetensors file or directory containing it (for offline compute nodes).",
         ),
         click.option("--depth-frame-step", type=click.IntRange(min=1), default=None),
         click.option("--dav3-process-res", type=click.IntRange(min=56), default=None),
