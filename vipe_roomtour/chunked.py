@@ -12,7 +12,7 @@ import os
 import queue
 import subprocess
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -784,9 +784,22 @@ def _run_chunk_depth_jobs(
             devices.put(device)
 
     logger.info("Running dense DAv3 for %d chunks on %d GPU worker(s)", len(jobs), depth_workers)
+    if depth_workers == 1:
+        for chunk in jobs:
+            run_one(chunk)
+        return
     with ThreadPoolExecutor(max_workers=depth_workers) as executor:
         futures = [executor.submit(run_one, chunk) for chunk in jobs]
-        for future in futures:
+        done, pending = wait(futures, return_when=FIRST_EXCEPTION)
+        first_error = next(
+            (future.exception() for future in done if future.exception() is not None),
+            None,
+        )
+        if first_error is not None:
+            for future in pending:
+                future.cancel()
+            raise first_error
+        for future in pending:
             future.result()
 
 

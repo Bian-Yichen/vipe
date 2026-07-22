@@ -18,7 +18,7 @@ net:
 
 head:
   __object__:
-    path: vipe.priors.depth.dav3.model.dualdpt
+    path: vipe.priors.depth.dav3.model.heads
     name: DualDPT
     args: as_params
 
@@ -29,7 +29,7 @@ head:
 
 cam_enc:
   __object__:
-    path: vipe.priors.depth.dav3.model.cam_enc
+    path: vipe.priors.depth.dav3.model.heads
     name: CameraEnc
     args: as_params
 
@@ -37,7 +37,7 @@ cam_enc:
 
 cam_dec:
   __object__:
-    path: vipe.priors.depth.dav3.model.cam_dec
+    path: vipe.priors.depth.dav3.model.heads
     name: CameraDec
     args: as_params
 

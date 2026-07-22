@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 
 import pytest
+from omegaconf import OmegaConf
 
 from vipe_roomtour.artifacts import ArtifactSet
 from vipe_roomtour.depth_options import DenseDepthOptions
@@ -33,7 +35,11 @@ def test_all_advertised_dav3_architecture_configs_are_vendored() -> None:
     for model in ("giant", "large", "base", "small"):
         config = config_dir / f"da3-{model}.yaml"
         assert config.is_file(), f"Missing DAv3 architecture config: {config}"
-        assert "path: vipe.priors.depth.dav3.model" in config.read_text()
+        loaded = OmegaConf.load(config)
+        for component in ("net", "head", "cam_enc", "cam_dec"):
+            target = loaded[component]["__object__"]
+            module = importlib.import_module(str(target["path"]))
+            assert getattr(module, str(target["name"]), None) is not None
 
 
 def test_explicit_depth_overrides_and_sparse_indices() -> None:
