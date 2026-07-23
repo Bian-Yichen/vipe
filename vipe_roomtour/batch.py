@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from fractions import Fraction
@@ -31,10 +32,46 @@ from .runner import run_roomtour
 logger = logging.getLogger(__name__)
 
 TERMINAL_STATUSES = {"success", "missing_remote"}
+_PROXY_ENV_NAMES = (
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+)
+_OFFLINE_MODEL_ENV = {
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "HF_DATASETS_OFFLINE": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+}
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+@contextmanager
+def _model_loading_environment(offline: bool):
+    previous = {
+        name: os.environ.get(name)
+        for name in _OFFLINE_MODEL_ENV
+    }
+    try:
+        if offline:
+            os.environ.update(_OFFLINE_MODEL_ENV)
+            logger.info(
+                "Model loading is offline; Hugging Face requests are disabled"
+            )
+        yield
+    finally:
+        if offline:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def youtube_video_id(url: str) -> str:
@@ -401,11 +438,13 @@ class RcloneClient:
         transfers: int = 16,
         checkers: int = 32,
         extra_args: tuple[str, ...] = (),
+        clear_proxy: bool = True,
     ):
         self.binary = binary
         self.transfers = int(transfers)
         self.checkers = int(checkers)
         self.extra_args = tuple(extra_args)
+        self.clear_proxy = bool(clear_proxy)
 
     def _transfer_args(self) -> list[str]:
         return [
@@ -415,6 +454,13 @@ class RcloneClient:
             str(self.checkers),
             *self.extra_args,
         ]
+
+    def _environment(self) -> dict[str, str]:
+        environment = os.environ.copy()
+        if self.clear_proxy:
+            for name in _PROXY_ENV_NAMES:
+                environment.pop(name, None)
+        return environment
 
     def list_top_level_files(self, remote_root: str) -> set[str]:
         command = [
@@ -431,6 +477,7 @@ class RcloneClient:
             check=True,
             text=True,
             stdout=subprocess.PIPE,
+            env=self._environment(),
         )
         return {
             line.strip().removeprefix("./")
@@ -448,7 +495,11 @@ class RcloneClient:
             *self._transfer_args(),
         ]
         logger.info("Downloading: %s", " ".join(command))
-        subprocess.run(command, check=True)
+        subprocess.run(
+            command,
+            check=True,
+            env=self._environment(),
+        )
 
     def copy_directory(self, source: Path, destination: str) -> None:
         command = [
@@ -459,7 +510,11 @@ class RcloneClient:
             *self._transfer_args(),
         ]
         logger.info("Uploading: %s", " ".join(command))
-        subprocess.run(command, check=True)
+        subprocess.run(
+            command,
+            check=True,
+            env=self._environment(),
+        )
 
     def copy_file(self, source: Path, destination: str) -> None:
         command = [
@@ -470,7 +525,11 @@ class RcloneClient:
             *self._transfer_args(),
         ]
         logger.info("Uploading manifest: %s", " ".join(command))
-        subprocess.run(command, check=True)
+        subprocess.run(
+            command,
+            check=True,
+            env=self._environment(),
+        )
 
 
 def _ffprobe_json(video: Path, *, count_frames: bool) -> dict[str, Any]:
@@ -676,6 +735,7 @@ def _run_chunk_slam(
     pipeline: str,
     depth_options: DenseDepthOptions,
     map_options: MapOptions,
+    offline_models: bool,
 ) -> None:
     config = _slam_config(pipeline, depth_options, map_options)
     marker = chunk_dir / ".slam_complete.json"
@@ -693,14 +753,15 @@ def _run_chunk_slam(
         # A missing/mismatched marker means this output may have had its
         # artifact RGB removed already. Rebuild this exact chunk cleanly.
         shutil.rmtree(vipe_root)
-    run_roomtour(
-        chunk_dir / "video.mp4",
-        vipe_root,
-        segments=[],
-        pipeline=pipeline,
-        map_options=map_options,
-        depth_options=depth_options,
-    )
+    with _model_loading_environment(offline_models):
+        run_roomtour(
+            chunk_dir / "video.mp4",
+            vipe_root,
+            segments=[],
+            pipeline=pipeline,
+            map_options=map_options,
+            depth_options=depth_options,
+        )
     shutil.rmtree(
         vipe_root / "vipe_artifacts" / "rgb",
         ignore_errors=True,
@@ -727,6 +788,7 @@ def _prepare_and_process_chunks(
     pipeline: str,
     depth_options: DenseDepthOptions,
     map_options: MapOptions,
+    offline_models: bool,
 ) -> list[Path]:
     """Pipeline one splitter thread into one sequential SLAM consumer."""
 
@@ -786,6 +848,7 @@ def _prepare_and_process_chunks(
                 pipeline=pipeline,
                 depth_options=depth_options,
                 map_options=map_options,
+                offline_models=offline_models,
             )
             completed.append(chunk_dir)
     finally:
@@ -925,6 +988,8 @@ def run_batch_worker(
     rclone_transfers: int = 16,
     rclone_checkers: int = 32,
     rclone_extra_args: tuple[str, ...] = (),
+    rclone_clear_proxy: bool = True,
+    offline_models: bool = True,
     fail_fast: bool = False,
 ) -> dict[str, int]:
     """Claim and process every currently available URL not owned by another worker."""
@@ -952,6 +1017,7 @@ def run_batch_worker(
         transfers=rclone_transfers,
         checkers=rclone_checkers,
         extra_args=rclone_extra_args,
+        clear_proxy=rclone_clear_proxy,
     )
     remote_files = {
         name
@@ -1063,6 +1129,7 @@ def run_batch_worker(
                     pipeline=pipeline,
                     depth_options=depth_options,
                     map_options=map_options,
+                    offline_models=offline_models,
                 )
                 _upload_video_results(
                     rclone,

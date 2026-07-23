@@ -347,10 +347,22 @@ def chunked_run_command(
 @click.option("--rclone-transfers", type=click.IntRange(min=1), default=16, show_default=True)
 @click.option("--rclone-checkers", type=click.IntRange(min=1), default=32, show_default=True)
 @click.option(
+    "--rclone-clear-proxy/--rclone-use-proxy",
+    default=True,
+    show_default=True,
+    help="Remove HTTP/HTTPS/ALL proxy variables only from rclone subprocesses.",
+)
+@click.option(
     "--rclone-extra-arg",
     "rclone_extra_args",
     multiple=True,
     help="Extra rclone argument; repeat the option for multiple arguments.",
+)
+@click.option(
+    "--offline-models/--online-models",
+    default=True,
+    show_default=True,
+    help="Load every VIPE/Hugging Face model from local caches without network metadata checks.",
 )
 @click.option("--fail-fast", is_flag=True, help="Stop this process on its first failed video.")
 @_common_depth_options
@@ -372,7 +384,9 @@ def batch_run_command(
     rclone_bin: str,
     rclone_transfers: int,
     rclone_checkers: int,
+    rclone_clear_proxy: bool,
     rclone_extra_args: tuple[str, ...],
+    offline_models: bool,
     fail_fast: bool,
     depth_preset: str,
     dav3_model: str | None,
@@ -424,6 +438,8 @@ def batch_run_command(
             rclone_transfers=rclone_transfers,
             rclone_checkers=rclone_checkers,
             rclone_extra_args=rclone_extra_args,
+            rclone_clear_proxy=rclone_clear_proxy,
+            offline_models=offline_models,
             fail_fast=fail_fast,
         )
         click.echo(json.dumps(summary, indent=2, sort_keys=True))

@@ -5,11 +5,13 @@ import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from vipe_roomtour import batch as batch_module
 from vipe_roomtour.batch import (
+    RcloneClient,
     StateStore,
     _cleanup_local_video,
     _prepare_and_process_chunks,
@@ -163,6 +165,7 @@ def test_split_thread_and_slam_consumer_are_separate(
         pipeline="roomtour_dav3",
         depth_options=object(),
         map_options=object(),
+        offline_models=True,
     )
 
     assert [path.name for path in result] == [
@@ -300,3 +303,44 @@ def test_success_uploads_then_cleans_then_marks_done(
 
     assert events == ["upload", "cleanup", "mark"]
     assert summary["success"] == 1
+
+
+def test_rclone_subprocess_clears_only_proxy_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in batch_module._PROXY_ENV_NAMES:
+        monkeypatch.setenv(name, f"value-{name}")
+    monkeypatch.setenv("KEEP_ME", "yes")
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["environment"] = kwargs["env"]
+        return SimpleNamespace(stdout="video123.mp4\n")
+
+    monkeypatch.setattr(batch_module.subprocess, "run", fake_run)
+    files = RcloneClient().list_top_level_files("h:input")
+
+    assert files == {"video123.mp4"}
+    assert captured["environment"]["KEEP_ME"] == "yes"
+    assert all(
+        name not in captured["environment"]
+        for name in batch_module._PROXY_ENV_NAMES
+    )
+
+
+def test_model_environment_forces_offline_and_restores_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HF_HUB_OFFLINE", "original")
+    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
+
+    with batch_module._model_loading_environment(True):
+        assert os.environ["HF_HUB_OFFLINE"] == "1"
+        assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+        assert os.environ["HF_DATASETS_OFFLINE"] == "1"
+        assert os.environ["HF_HUB_DISABLE_TELEMETRY"] == "1"
+
+    assert os.environ["HF_HUB_OFFLINE"] == "original"
+    assert "TRANSFORMERS_OFFLINE" not in os.environ
+    assert "HF_DATASETS_OFFLINE" not in os.environ
+    assert "HF_HUB_DISABLE_TELEMETRY" not in os.environ

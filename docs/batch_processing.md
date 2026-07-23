@@ -30,6 +30,16 @@ python -m vipe_roomtour.cli batch-run \
   --rclone-extra-arg=--s3-no-check-bucket
 ```
 
+By default, model inference is fully offline and rclone alone receives an
+environment with `http_proxy`, `https_proxy`, and `all_proxy` (including their
+uppercase forms) removed. Cached GeoCalib, DROID, DAv3 metric, and dense DAv3
+weights are used without Hugging Face HEAD requests. You therefore do not need
+to unset proxy variables for the complete shell command.
+
+If a model is not cached yet, run a separate online preparation once or pass
+`--online-models`. Use `--rclone-use-proxy` only for an rclone remote that
+actually requires the proxy.
+
 You may use the same absolute `PROCESSING_ROOT` for every independently
 launched command. Downloads, manifests, and chunk directories are namespaced
 by `VIDEO_ID`, while the shared lease prevents two workers from processing the
