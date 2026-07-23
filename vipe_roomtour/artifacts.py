@@ -16,7 +16,7 @@ import numpy as np
 from .depth_options import DenseDepthOptions
 from .geometry import intrinsics_matrix
 
-LOOP_CLOSURE_CACHE_VERSION = 2
+LOOP_CLOSURE_CACHE_VERSION = 3
 
 
 @dataclass(frozen=True)

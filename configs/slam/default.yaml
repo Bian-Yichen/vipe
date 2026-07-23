@@ -28,8 +28,8 @@ backend_iters: 24
 # numerically unchanged unless explicitly requested by the room-tour CLI.
 loop_closure:
   enabled: false
-  min_frame_gap: 900
-  min_keyframe_gap: 20
+  min_frame_gap: 300
+  min_keyframe_gap: 12
   retrieval_top_k: 4
   similarity_threshold: 0.45
   max_candidates: 48
@@ -37,6 +37,10 @@ loop_closure:
   sequence_radius: 2
   min_sequence_support: 2
   droid_retrieval_weight: 0.35
+  spatial_retrieval_radius: 4.5
+  spatial_retrieval_top_k: 24
+  spatial_max_candidates: 20
+  spatial_candidate_nms: 6
   vlad_words: 24
   vlad_sample_descriptors: 12000
   vlad_kmeans_iters: 8
@@ -57,6 +61,26 @@ loop_closure:
   min_switch_weight: 0.25
   pose_graph_max_local_change: 0.35
   pose_graph_max_nfev: 60
+  # v3: viewpoint-invariant registration of short SLAM point-cloud windows.
+  submap_filter_thresh: 0.05
+  submap_radius_small: 3
+  submap_radius_large: 5
+  submap_voxel_size: 0.08
+  submap_correlation_voxel_size: 0.10
+  submap_correlation_peaks: 5
+  submap_max_correlation_cells: 8000000
+  submap_max_translation: 3.0
+  submap_max_rotation_deg: 15.0
+  submap_icp_max_correspondence: 0.55
+  submap_evaluation_distance: 0.20
+  submap_min_symmetric_overlap: 0.20
+  submap_min_mutual_correspondences: 220
+  submap_max_rmse: 0.12
+  submap_min_normal_consistency: 0.62
+  submap_max_chromaticity_error: 0.14
+  submap_translation_consistency: 0.40
+  submap_rotation_consistency_deg: 4.0
+  submap_min_ambiguity_ratio: 1.02
 # Initial values for disparity
 init_disp: 1.0
 # Whether to optimize intrinsics

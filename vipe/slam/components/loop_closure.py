@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Appearance-retrieved, geometry-verified loop closure for single-view ViPE.
+"""Appearance- and submap-verified loop closure for single-view ViPE.
 
 The stock DROID backend proposes long-range factors from the *current* pose and
 depth estimate.  A genuine revisit can therefore be missed once drift makes the
-two observations geometrically distant.  This module adds an independent place
-recognition path, verifies candidates with RGB features and keyframe depth, and
-uses the resulting SE(3) constraints to initialize a final dense DROID BA.
+two observations geometrically distant.  This module adds independent
+appearance retrieval plus multiscale local-submap registration, then uses the
+resulting SE(3) constraints to initialize a final dense DROID BA.
 """
 
 from __future__ import annotations
@@ -29,10 +29,15 @@ from vipe.ext.lietorch import SE3
 from vipe.utils.geometry import se3_matrix_to_se3
 
 from .buffer import GraphBuffer
+from .submap_registration import (
+    SubmapRegistrationOptions,
+    independent_transform_support,
+    register_packed_submaps,
+)
 
 logger = logging.getLogger(__name__)
 
-LOOP_CLOSURE_VERSION = 2
+LOOP_CLOSURE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -40,8 +45,8 @@ class LoopClosureOptions:
     # Require a genuinely long revisit.  Raw-frame and keyframe gaps are both
     # needed because a nearly stationary camera can produce very sparse
     # keyframes over hundreds of decoded frames.
-    min_frame_gap: int = 900
-    min_keyframe_gap: int = 20
+    min_frame_gap: int = 300
+    min_keyframe_gap: int = 12
     retrieval_top_k: int = 4
     similarity_threshold: float = 0.45
     max_candidates: int = 48
@@ -49,6 +54,14 @@ class LoopClosureOptions:
     sequence_radius: int = 2
     min_sequence_support: int = 2
     droid_retrieval_weight: float = 0.35
+    spatial_retrieval_radius: float = 4.5
+    # Retain enough trajectory-near alternatives to cover the same landing
+    # before and after a turn. Ranking only by the drifted pose selected the
+    # nearest white wall in the real stair sequence and hid the useful
+    # viewpoint-reversed anchors at ranks 19-20.
+    spatial_retrieval_top_k: int = 24
+    spatial_max_candidates: int = 20
+    spatial_candidate_nms: int = 6
     vlad_words: int = 24
     vlad_sample_descriptors: int = 12000
     vlad_kmeans_iters: int = 8
@@ -69,6 +82,25 @@ class LoopClosureOptions:
     min_switch_weight: float = 0.25
     pose_graph_max_local_change: float = 0.35
     pose_graph_max_nfev: int = 60
+    submap_filter_thresh: float = 0.05
+    submap_radius_small: int = 3
+    submap_radius_large: int = 5
+    submap_voxel_size: float = 0.08
+    submap_correlation_voxel_size: float = 0.10
+    submap_correlation_peaks: int = 5
+    submap_max_correlation_cells: int = 8_000_000
+    submap_max_translation: float = 3.0
+    submap_max_rotation_deg: float = 15.0
+    submap_icp_max_correspondence: float = 0.55
+    submap_evaluation_distance: float = 0.20
+    submap_min_symmetric_overlap: float = 0.20
+    submap_min_mutual_correspondences: int = 220
+    submap_max_rmse: float = 0.12
+    submap_min_normal_consistency: float = 0.62
+    submap_max_chromaticity_error: float = 0.14
+    submap_translation_consistency: float = 0.40
+    submap_rotation_consistency_deg: float = 4.0
+    submap_min_ambiguity_ratio: float = 1.02
 
     @classmethod
     def from_config(cls, config: Any) -> "LoopClosureOptions":
@@ -102,15 +134,26 @@ class LoopConstraint:
     current_translation_error: float
     target_from_source: np.ndarray
     cluster_support: int = 1
+    verification_method: str = "image_pnp"
+    registration_score: float | None = None
+    add_droid_factor: bool = True
+    world_correction: np.ndarray | None = None
 
     @property
     def score(self) -> float:
+        if self.registration_score is not None:
+            return float(self.registration_score)
         retrieval = 0.35 * self.similarity + 0.65 * self.sequence_similarity
         return float(retrieval * self.inlier_ratio * min(self.inliers / 80.0, 1.0))
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["target_from_source"] = self.target_from_source.tolist()
+        result["world_correction"] = (
+            None
+            if self.world_correction is None
+            else self.world_correction.tolist()
+        )
         result["score"] = self.score
         return result
 
@@ -290,8 +333,14 @@ def _advanced_candidate_pairs(
     buffer: GraphBuffer,
     cache: _FeatureCache,
     options: LoopClosureOptions,
-) -> tuple[list[tuple[int, int, float, float, int, float]], dict[str, Any]]:
-    """Retrieve long sequence-level loop seeds, independent of current pose."""
+) -> tuple[list[tuple[int, int, float, float, int, float, str]], dict[str, Any]]:
+    """Retrieve both appearance and local-submap loop seeds.
+
+    Appearance retrieval handles ordinary revisits.  A second, deliberately
+    independent path proposes temporally distant but spatially nearby
+    keyframes.  The latter are not trusted as loops until multiscale 3D submap
+    registration succeeds; current pose is only a cheap proposal prior.
+    """
 
     n_keyframes = int(buffer.n_frames)
     droid = _retrieval_descriptors(buffer, n_keyframes)
@@ -304,7 +353,9 @@ def _advanced_candidate_pairs(
     )
     timestamps = buffer.tstamp[:n_keyframes].detach().cpu().numpy().astype(np.int64)
     _, centers = _w2c_and_centers(buffer, n_keyframes)
-    candidates: list[tuple[int, int, float, float, int, float]] = []
+    appearance_candidates: list[
+        tuple[int, int, float, float, int, float, str]
+    ] = []
 
     for target in range(n_keyframes):
         target_candidates = []
@@ -330,32 +381,108 @@ def _advanced_candidate_pairs(
                     sequence_similarity,
                     direction,
                     pose_distance,
+                    "appearance",
                 )
             )
         target_candidates.sort(key=lambda item: item[3], reverse=True)
-        candidates.extend(target_candidates[: options.retrieval_top_k])
+        appearance_candidates.extend(
+            target_candidates[: options.retrieval_top_k]
+        )
 
-    selected: list[tuple[int, int, float, float, int, float]] = []
-    for candidate in sorted(candidates, key=lambda item: item[3], reverse=True):
+    appearance_selected: list[
+        tuple[int, int, float, float, int, float, str]
+    ] = []
+    for candidate in sorted(
+        appearance_candidates,
+        key=lambda item: item[3],
+        reverse=True,
+    ):
         source, target = candidate[:2]
         if any(
             abs(source - old_source) <= options.candidate_nms
             and abs(target - old_target) <= options.candidate_nms
-            for old_source, old_target, *_ in selected
+            for old_source, old_target, *_ in appearance_selected
         ):
             continue
-        selected.append(candidate)
-        if len(selected) >= options.max_candidates:
+        appearance_selected.append(candidate)
+        if len(appearance_selected) >= options.max_candidates:
             break
+
+    spatial_candidates: list[
+        tuple[int, int, float, float, int, float, str]
+    ] = []
+    for target in range(n_keyframes):
+        per_target = []
+        for source in range(target):
+            if target - source < options.min_keyframe_gap:
+                continue
+            if timestamps[target] - timestamps[source] < options.min_frame_gap:
+                continue
+            pose_distance = float(
+                np.linalg.norm(centers[source] - centers[target])
+            )
+            if pose_distance > options.spatial_retrieval_radius:
+                continue
+            sequence_similarity, direction = _sequence_score(
+                similarities,
+                source,
+                target,
+                options.sequence_radius,
+            )
+            per_target.append(
+                (
+                    source,
+                    target,
+                    float(similarities[source, target]),
+                    sequence_similarity,
+                    direction,
+                    pose_distance,
+                    "spatial_submap",
+                )
+            )
+        per_target.sort(key=lambda item: item[5])
+        spatial_candidates.extend(
+            per_target[: options.spatial_retrieval_top_k]
+        )
+
+    spatial_selected: list[
+        tuple[int, int, float, float, int, float, str]
+    ] = []
+    appearance_pairs = {
+        (source, target)
+        for source, target, *_ in appearance_selected
+    }
+    for candidate in sorted(spatial_candidates, key=lambda item: item[5]):
+        source, target = candidate[:2]
+        if (source, target) in appearance_pairs:
+            continue
+        if any(
+            abs(source - old_source) <= options.spatial_candidate_nms
+            and abs(target - old_target) <= options.spatial_candidate_nms
+            for old_source, old_target, *_ in spatial_selected
+        ):
+            continue
+        spatial_selected.append(candidate)
+        if len(spatial_selected) >= options.spatial_max_candidates:
+            break
+
+    selected = appearance_selected + spatial_selected
     droid_weight = options.droid_retrieval_weight
     return selected, {
         "version": LOOP_CLOSURE_VERSION,
         "keyframes": n_keyframes,
-        "raw_long_sequence_candidates": len(candidates),
+        "raw_long_sequence_candidates": len(appearance_candidates),
+        "raw_spatial_candidates": len(spatial_candidates),
+        "appearance_candidates_after_nms": len(appearance_selected),
+        "spatial_candidates_after_nms": len(spatial_selected),
         "candidates_after_nms": len(selected),
         "retrieval_descriptor": (
             f"{droid_weight:.2f} DROID spatial pyramid + "
             f"{1.0 - droid_weight:.2f} video-specific RootSIFT-VLAD"
+        ),
+        "spatial_retrieval": (
+            "trajectory-radius proposal followed by multiscale SLAM-submap "
+            "cross-correlation and reciprocal ICP"
         ),
         "minimum_raw_frame_gap": options.min_frame_gap,
         "minimum_keyframe_gap": options.min_keyframe_gap,
@@ -578,18 +705,147 @@ def _verify_candidate(
     )
 
 
+def _submap_options(options: LoopClosureOptions) -> SubmapRegistrationOptions:
+    return SubmapRegistrationOptions(
+        radius_small=options.submap_radius_small,
+        radius_large=options.submap_radius_large,
+        voxel_size=options.submap_voxel_size,
+        correlation_voxel_size=options.submap_correlation_voxel_size,
+        correlation_peaks=options.submap_correlation_peaks,
+        max_correlation_cells=options.submap_max_correlation_cells,
+        max_translation=options.submap_max_translation,
+        max_rotation_deg=options.submap_max_rotation_deg,
+        icp_max_correspondence=options.submap_icp_max_correspondence,
+        evaluation_distance=options.submap_evaluation_distance,
+        min_symmetric_overlap=options.submap_min_symmetric_overlap,
+        min_mutual_correspondences=options.submap_min_mutual_correspondences,
+        max_rmse=options.submap_max_rmse,
+        min_normal_consistency=options.submap_min_normal_consistency,
+        max_chromaticity_error=options.submap_max_chromaticity_error,
+        translation_consistency=options.submap_translation_consistency,
+        rotation_consistency_deg=options.submap_rotation_consistency_deg,
+        min_ambiguity_ratio=options.submap_min_ambiguity_ratio,
+    )
+
+
+def _constraint_from_submap(
+    source: int,
+    target: int,
+    similarity: float,
+    sequence_similarity: float,
+    sequence_direction: int,
+    registration,
+    timestamps: np.ndarray,
+    w2c: np.ndarray,
+) -> LoopConstraint:
+    """Convert a world-space target-to-source correction into a pose factor."""
+
+    target_world_to_source_world = (
+        registration.target_world_to_source_world
+    )
+    if target_world_to_source_world is None or registration.metrics is None:
+        raise ValueError("Cannot build a loop constraint from rejected registration")
+    # Keep the source side fixed.  Applying D to target C2W gives
+    # C2W_target' = D @ C2W_target, hence:
+    # W2C_target' @ C2W_source
+    #   = W2C_target @ inv(D) @ C2W_source.
+    target_from_source = (
+        w2c[target]
+        @ np.linalg.inv(target_world_to_source_world)
+        @ np.linalg.inv(w2c[source])
+    )
+    current = w2c[target] @ np.linalg.inv(w2c[source])
+    correction = target_from_source @ np.linalg.inv(current)
+    metrics = registration.metrics
+    registration_score = float(
+        metrics.symmetric_overlap
+        * (0.5 + 0.5 * metrics.normal_consistency)
+        * min(registration.ambiguity_ratio, 1.5)
+    )
+    return LoopConstraint(
+        source=source,
+        target=target,
+        source_frame=int(timestamps[source]),
+        target_frame=int(timestamps[target]),
+        similarity=similarity,
+        sequence_similarity=sequence_similarity,
+        sequence_direction=sequence_direction,
+        matches=min(registration.source_points, registration.target_points),
+        inliers=metrics.mutual_correspondences,
+        inlier_ratio=metrics.symmetric_overlap,
+        essential_inliers=0,
+        essential_rotation_error_deg=0.0,
+        median_reprojection_error=metrics.rmse,
+        cycle_rotation_deg=0.0,
+        cycle_translation=0.0,
+        current_rotation_error_deg=_rotation_degrees(correction),
+        current_translation_error=float(np.linalg.norm(correction[:3, 3])),
+        target_from_source=target_from_source,
+        # Two radii are measurements of the same anchor pair, not independent
+        # evidence. A large correction is admitted only after another nearby
+        # keyframe pair estimates the same world transform.
+        cluster_support=1,
+        verification_method="multiscale_slam_submap",
+        registration_score=registration_score,
+        # Opposite-view anchors need not share image pixels.  Their 3D factor
+        # initializes the pose graph, while the final DROID graph decides which
+        # corrected-pose neighbors have actual dense-flow overlap.
+        add_droid_factor=False,
+        world_correction=target_world_to_source_world,
+    )
+
+
 def _sequence_filter(
     constraints: list[LoopConstraint], options: LoopClosureOptions
 ) -> list[LoopConstraint]:
     if options.min_cluster_support <= 1:
         return constraints
+    submap_constraints = [
+        constraint
+        for constraint in constraints
+        if constraint.verification_method == "multiscale_slam_submap"
+        and constraint.world_correction is not None
+    ]
+    submap_support = independent_transform_support(
+        [
+            (
+                constraint.source,
+                constraint.target,
+                constraint.world_correction,
+            )
+            for constraint in submap_constraints
+        ],
+        index_radius=options.cluster_radius,
+        max_translation=options.submap_translation_consistency,
+        max_rotation_deg=options.submap_rotation_consistency_deg,
+    )
+    support_by_pair = {
+        (constraint.source, constraint.target): int(support)
+        for constraint, support in zip(
+            submap_constraints,
+            submap_support,
+            strict=True,
+        )
+    }
     retained = []
     for constraint in constraints:
-        support = sum(
-            abs(constraint.source - other.source) <= options.cluster_radius
-            and abs(constraint.target - other.target) <= options.cluster_radius
-            for other in constraints
-        )
+        if constraint.verification_method == "multiscale_slam_submap":
+            support = support_by_pair.get(
+                (constraint.source, constraint.target),
+                0,
+            )
+        else:
+            support = max(
+                constraint.cluster_support,
+                sum(
+                    other.verification_method == "image_pnp"
+                    and abs(constraint.source - other.source)
+                    <= options.cluster_radius
+                    and abs(constraint.target - other.target)
+                    <= options.cluster_radius
+                    for other in constraints
+                ),
+            )
         constraint.cluster_support = support
         if support >= options.min_cluster_support:
             retained.append(constraint)
@@ -641,7 +897,17 @@ def _optimize_pose_graph_matrices(
             odometry_edges.append((source, target, measurement, weight))
     loop_edges: list[tuple[int, int, np.ndarray, float]] = []
     for constraint in constraints:
-        confidence = min(constraint.inliers / 80.0, 1.0) * constraint.inlier_ratio
+        if constraint.verification_method == "multiscale_slam_submap":
+            confidence = min(
+                1.0,
+                0.55 * constraint.inlier_ratio
+                + 0.45 * min(constraint.cluster_support / 2.0, 1.0),
+            )
+        else:
+            confidence = (
+                min(constraint.inliers / 80.0, 1.0)
+                * constraint.inlier_ratio
+            )
         loop_edges.append(
             (
                 constraint.source,
@@ -780,6 +1046,14 @@ def _optimize_pose_graph_matrices(
     finite = bool(np.all(np.isfinite(corrected)))
     max_center_correction = float(np.max(center_correction))
     max_local_change = float(np.max(local_changes, initial=0.0))
+    minimum_robust_edges = (
+        1
+        if any(
+            constraint.verification_method == "multiscale_slam_submap"
+            for constraint in constraints
+        )
+        else options.min_cluster_support
+    )
     checks = {
         "finite": finite,
         "cost_decreased": cost_after < cost_before,
@@ -787,7 +1061,7 @@ def _optimize_pose_graph_matrices(
         "max_local_odometry_change_within_limit": max_local_change
         <= options.pose_graph_max_local_change,
         "enough_robust_loop_edges": len(retained_indices)
-        >= options.min_cluster_support,
+        >= minimum_robust_edges,
     }
     applied = all(checks.values())
     report = {
@@ -810,6 +1084,7 @@ def _optimize_pose_graph_matrices(
         "switchable_function_evaluations": int(first_result.nfev),
         "robust_loop_switch_weights": switch_weights.tolist(),
         "robust_loop_edges_retained": int(len(retained_indices)),
+        "minimum_robust_loop_edges": int(minimum_robust_edges),
     }
     # Hitting max_nfev is not itself a rejection: a finite, lower-cost and
     # locally smooth solution is safe to use and the final dense BA will refine
@@ -847,7 +1122,113 @@ def detect_and_correct_loops(
     pair_cache: dict[tuple[int, int], tuple[LoopConstraint | None, str]] = {}
     rejections: Counter[str] = Counter()
     candidate_records = []
-    for source, target, similarity, sequence_similarity, direction, pose_distance in candidates:
+    submap_arrays = None
+    submap_error = None
+    if any(candidate[-1] == "spatial_submap" for candidate in candidates):
+        try:
+            slam_map = buffer.extract_slam_map(
+                filter_thresh=options.submap_filter_thresh
+            )
+            if len(slam_map.dense_disp_frame_inds) != int(buffer.n_frames):
+                raise RuntimeError(
+                    "Loop-closure SLAM map/keyframe count mismatch: "
+                    f"{len(slam_map.dense_disp_frame_inds)} != {buffer.n_frames}"
+                )
+            submap_arrays = (
+                slam_map.dense_disp_xyz.detach().cpu().numpy(),
+                slam_map.dense_disp_rgb.detach().float().cpu().numpy(),
+                slam_map.dense_disp_packinfo.detach().cpu().numpy(),
+            )
+        except (RuntimeError, MemoryError, ValueError) as exc:
+            submap_error = str(exc)
+            retrieval_report["spatial_submap_error"] = submap_error
+            logger.warning(
+                "Disabling v3 submap verification for this chunk: %s",
+                exc,
+            )
+    for (
+        source,
+        target,
+        similarity,
+        sequence_similarity,
+        direction,
+        pose_distance,
+        retrieval_kind,
+    ) in candidates:
+        if retrieval_kind == "spatial_submap":
+            if submap_arrays is None:
+                result = "submap_map_unavailable"
+                rejections[result] += 1
+                candidate_records.append(
+                    {
+                        "source_keyframe": source,
+                        "target_keyframe": target,
+                        "source_frame": int(timestamps[source]),
+                        "target_frame": int(timestamps[target]),
+                        "retrieval_kind": retrieval_kind,
+                        "current_camera_distance": pose_distance,
+                        "result": result,
+                        "error": submap_error,
+                    }
+                )
+                continue
+            try:
+                registration = register_packed_submaps(
+                    *submap_arrays,
+                    source,
+                    target,
+                    _submap_options(options),
+                )
+            except (
+                RuntimeError,
+                MemoryError,
+                ValueError,
+                np.linalg.LinAlgError,
+            ) as exc:
+                logger.debug(
+                    "Rejected submap loop %d -> %d: %s",
+                    source,
+                    target,
+                    exc,
+                )
+                registration = None
+                result = "submap_registration_exception"
+            else:
+                result = registration.reason
+            record: dict[str, Any] = {
+                "source_keyframe": source,
+                "target_keyframe": target,
+                "source_frame": int(timestamps[source]),
+                "target_frame": int(timestamps[target]),
+                "retrieval_kind": retrieval_kind,
+                "similarity": similarity,
+                "sequence_similarity": sequence_similarity,
+                "sequence_direction": direction,
+                "current_camera_distance": pose_distance,
+                "result": result,
+                "registration": (
+                    None if registration is None else registration.to_dict()
+                ),
+            }
+            if registration is not None and registration.accepted:
+                constraint = _constraint_from_submap(
+                    source,
+                    target,
+                    similarity,
+                    sequence_similarity,
+                    direction,
+                    registration,
+                    timestamps,
+                    w2c,
+                )
+                verified_by_pair[(source, target)] = constraint
+                record["constraint"] = constraint.to_dict()
+                rejections["accepted_submap"] += 1
+            else:
+                rejections[result] += 1
+            candidate_records.append(record)
+            continue
+
         sequence_constraints = []
         pair_records = []
         for offset in range(-options.sequence_radius, options.sequence_radius + 1):
@@ -913,6 +1294,7 @@ def detect_and_correct_loops(
             "target_keyframe": target,
             "source_frame": int(timestamps[source]),
             "target_frame": int(timestamps[target]),
+            "retrieval_kind": retrieval_kind,
             "similarity": similarity,
             "sequence_similarity": sequence_similarity,
             "sequence_direction": direction,
@@ -931,6 +1313,8 @@ def detect_and_correct_loops(
         "options": asdict(options),
         "retrieval": retrieval_report,
         "verification_counts": dict(rejections),
+        "verified_loop_constraints_before_filter": len(verified),
+        # Kept for report readers written against v1/v2.
         "verified_long_pairs_before_filter": len(verified),
         "accepted_loop_edges": len(retained),
         "accepted": [constraint.to_dict() for constraint in retained],
@@ -939,7 +1323,9 @@ def detect_and_correct_loops(
         "pose_graph": None,
     }
     if not retained:
-        logger.warning("Loop closure v2 found no sequence-supported long-range edge")
+        logger.warning(
+            "Loop closure v3 found no verified appearance or submap constraint"
+        )
         return None, report
 
     report["pose_graph"] = _pose_graph_optimize(buffer, retained, options)
@@ -974,15 +1360,33 @@ def detect_and_correct_loops(
     if not robust_retained:
         logger.warning("Loop pose graph downweighted every long-range edge")
         return None, report
-    edges = torch.tensor(
-        [[constraint.source, constraint.target] for constraint in robust_retained],
-        dtype=torch.long,
-        device=buffer.device,
+    droid_constraints = [
+        constraint
+        for constraint in robust_retained
+        if constraint.add_droid_factor
+    ]
+    if droid_constraints:
+        edges = torch.tensor(
+            [
+                [constraint.source, constraint.target]
+                for constraint in droid_constraints
+            ],
+            dtype=torch.long,
+            device=buffer.device,
+        )
+    else:
+        edges = torch.empty((0, 2), dtype=torch.long, device=buffer.device)
+    report["droid_loop_edges"] = len(droid_constraints)
+    report["submap_pose_only_edges"] = (
+        len(robust_retained) - len(droid_constraints)
     )
     logger.info(
-        "Loop closure accepted %d/%d candidates; pose graph cost %.3f -> %.3f",
+        "Loop closure v3 accepted %d/%d candidates (%d image, %d submap); "
+        "pose graph cost %.3f -> %.3f",
         len(robust_retained),
         len(candidates),
+        len(droid_constraints),
+        len(robust_retained) - len(droid_constraints),
         report["pose_graph"]["cost_before"],
         report["pose_graph"]["cost_after"],
     )

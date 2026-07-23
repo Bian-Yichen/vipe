@@ -115,7 +115,7 @@ def test_artifacts_do_not_cross_reuse_loop_closure_variants(tmp_path: Path) -> N
     assert not artifact.depth_matches(options, loop_closure=False)
 
     # A v1 experiment must not silently feed its poses or dense depth into the
-    # stronger v2 algorithm, even when the command-line flag is unchanged.
+    # stronger algorithm, even when the command-line flag is unchanged.
     with artifact.info.open("wb") as handle:
         pickle.dump({"loop_closure_enabled": True, "loop_closure_version": 1}, handle)
     old_depth_metadata = json.loads(artifact.depth_metadata.read_text())
