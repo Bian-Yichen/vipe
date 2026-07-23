@@ -46,6 +46,10 @@ _OFFLINE_MODEL_ENV = {
     "HF_DATASETS_OFFLINE": "1",
     "HF_HUB_DISABLE_TELEMETRY": "1",
 }
+_VIDEO_LOG_ENV = "VIPE_ROOMTOUR_LOG_FILE"
+_VIDEO_LOG_FORMAT = (
+    "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
 
 
 def _utc_now() -> str:
@@ -72,6 +76,49 @@ def _model_loading_environment(offline: bool):
                     os.environ.pop(name, None)
                 else:
                     os.environ[name] = value
+
+
+@contextmanager
+def _video_log_context(
+    processing_root: Path,
+    video_id: str,
+    worker_id: str,
+):
+    log_root = Path(processing_root) / "log"
+    log_root.mkdir(parents=True, exist_ok=True)
+    log_path = log_root / f"{video_id}.log"
+    handler = logging.FileHandler(
+        log_path,
+        mode="a",
+        encoding="utf-8",
+    )
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(_VIDEO_LOG_FORMAT))
+    root_logger = logging.getLogger()
+    previous_child_log = os.environ.get(_VIDEO_LOG_ENV)
+    root_logger.addHandler(handler)
+    os.environ[_VIDEO_LOG_ENV] = str(log_path.resolve())
+    try:
+        logger.info(
+            "=== video attempt started: video_id=%s worker_id=%s pid=%d ===",
+            video_id,
+            worker_id,
+            os.getpid(),
+        )
+        yield log_path
+    finally:
+        logger.info(
+            "=== video attempt finished: video_id=%s worker_id=%s pid=%d ===",
+            video_id,
+            worker_id,
+            os.getpid(),
+        )
+        if previous_child_log is None:
+            os.environ.pop(_VIDEO_LOG_ENV, None)
+        else:
+            os.environ[_VIDEO_LOG_ENV] = previous_child_log
+        root_logger.removeHandler(handler)
+        handler.close()
 
 
 def youtube_video_id(url: str) -> str:
@@ -1067,7 +1114,11 @@ def run_batch_worker(
             continue
         attempted.add(video_id)
         summary["claimed"] += 1
-        with claim:
+        with claim, _video_log_context(
+            processing_root,
+            video_id,
+            worker_id,
+        ):
             if f"{video_id}.mp4" not in remote_files:
                 try:
                     _cleanup_local_video(processing_root, video_id)

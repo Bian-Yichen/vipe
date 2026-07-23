@@ -14,10 +14,15 @@
 # limitations under the License.
 
 import logging
+import os
+from pathlib import Path
 
 import tqdm
 
 disable_progress_bar: bool = False
+
+_VIDEO_LOG_ENV = "VIPE_ROOMTOUR_LOG_FILE"
+_VIDEO_LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 
 
 def configure_logging() -> logging.Logger:
@@ -40,6 +45,21 @@ def configure_logging() -> logging.Logger:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     logger.propagate = False
+
+    video_log = os.environ.get(_VIDEO_LOG_ENV)
+    if video_log:
+        log_path = Path(video_log).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(
+            log_path,
+            mode="a",
+            encoding="utf-8",
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(_VIDEO_LOG_FORMAT))
+        logger.addHandler(file_handler)
+        # Hugging Face and other non-vipe warnings use the root logger.
+        logging.getLogger().addHandler(file_handler)
 
     return logger
 

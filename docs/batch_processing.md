@@ -46,6 +46,13 @@ by `VIDEO_ID`, while the shared lease prevents two workers from processing the
 same video. Every command still runs one batch worker and processes its claimed
 videos sequentially.
 
+Each claimed video also gets an append-only local log at
+`PROCESSING_ROOT/log/VIDEO_ID.log`. It contains the parent batch events and the
+child VIPE/SLAM logger output. The video lease prevents concurrent writers for
+the same `VIDEO_ID`; different workers write different files. A retry appends a
+new attempt to the existing log. Successful-result cleanup deliberately keeps
+the `log/` directory.
+
 ## Chunk rule
 
 Ranges are half-open: `[start_frame, end_frame)`.

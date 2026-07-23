@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -15,6 +16,7 @@ from vipe_roomtour.batch import (
     StateStore,
     _cleanup_local_video,
     _prepare_and_process_chunks,
+    _video_log_context,
     plan_independent_chunks,
     remote_join,
     youtube_video_id,
@@ -303,6 +305,7 @@ def test_success_uploads_then_cleans_then_marks_done(
 
     assert events == ["upload", "cleanup", "mark"]
     assert summary["success"] == 1
+    assert (processing_root / "log" / "video123.log").is_file()
 
 
 def test_rclone_subprocess_clears_only_proxy_environment(
@@ -344,3 +347,71 @@ def test_model_environment_forces_offline_and_restores_parent(
     assert "TRANSFORMERS_OFFLINE" not in os.environ
     assert "HF_DATASETS_OFFLINE" not in os.environ
     assert "HF_HUB_DISABLE_TELEMETRY" not in os.environ
+
+
+def test_video_logs_are_isolated_and_retries_append(
+    tmp_path: Path,
+) -> None:
+    first_logger = logging.getLogger("test.video.first")
+    second_logger = logging.getLogger("test.video.second")
+    previous_level = logging.getLogger().level
+    logging.getLogger().setLevel(logging.INFO)
+    try:
+        with _video_log_context(tmp_path, "video-a", "worker-1"):
+            first_logger.info("first attempt payload")
+        with _video_log_context(tmp_path, "video-b", "worker-2"):
+            second_logger.info("second video payload")
+        with _video_log_context(tmp_path, "video-a", "worker-3"):
+            first_logger.info("retry payload")
+    finally:
+        logging.getLogger().setLevel(previous_level)
+
+    first_log = (tmp_path / "log" / "video-a.log").read_text()
+    second_log = (tmp_path / "log" / "video-b.log").read_text()
+    assert "first attempt payload" in first_log
+    assert "retry payload" in first_log
+    assert "second video payload" not in first_log
+    assert "second video payload" in second_log
+    assert "first attempt payload" not in second_log
+
+
+def test_child_vipe_logger_uses_inherited_video_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vipe.utils.logging import configure_logging
+
+    log_path = tmp_path / "log" / "video-a.log"
+    monkeypatch.setenv(
+        batch_module._VIDEO_LOG_ENV,
+        str(log_path),
+    )
+    vipe_logger = logging.getLogger("vipe")
+    root_logger = logging.getLogger()
+    original_vipe_handlers = list(vipe_logger.handlers)
+    original_root_handlers = list(root_logger.handlers)
+    original_propagate = vipe_logger.propagate
+    original_level = vipe_logger.level
+    try:
+        configured = configure_logging()
+        configured.info("child slam message")
+        logging.getLogger("huggingface_hub").warning(
+            "child hub warning"
+        )
+        for handler in configured.handlers + root_logger.handlers:
+            handler.flush()
+    finally:
+        for handler in list(vipe_logger.handlers):
+            if handler not in original_vipe_handlers:
+                vipe_logger.removeHandler(handler)
+                handler.close()
+        for handler in list(root_logger.handlers):
+            if handler not in original_root_handlers:
+                root_logger.removeHandler(handler)
+                handler.close()
+        vipe_logger.propagate = original_propagate
+        vipe_logger.setLevel(original_level)
+
+    text = log_path.read_text()
+    assert "child slam message" in text
+    assert "child hub warning" in text
