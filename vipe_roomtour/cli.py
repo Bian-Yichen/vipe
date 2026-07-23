@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 from pathlib import Path
@@ -12,6 +13,7 @@ from pathlib import Path
 import click
 
 from .artifacts import discover_artifacts
+from .batch import run_batch_worker
 from .chunked import StitchThresholds, run_chunked_roomtour
 from .depth_options import DenseDepthOptions
 from .map_builder import MapOptions, build_map
@@ -297,6 +299,153 @@ def chunked_run_command(
             depth_workers=depth_workers,
         )
     except (ValueError, FileNotFoundError, RuntimeError, NotImplementedError, subprocess.CalledProcessError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@main.command("batch-run")
+@click.argument(
+    "urls_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.argument(
+    "processing_root",
+    type=click.Path(file_okay=False, path_type=Path),
+)
+@click.argument("remote_output", type=str)
+@click.option(
+    "--state-file",
+    type=click.Path(dir_okay=False, path_type=Path),
+    required=True,
+    help="Absolute JSONL path on a filesystem shared by every worker.",
+)
+@click.option(
+    "--source-remote",
+    default="h:bianyichen/AnyReconProDataset_processed/",
+    show_default=True,
+    help="rclone directory containing VIDEO_ID.mp4 files.",
+)
+@click.option("--pipeline", default="roomtour_dav3", show_default=True)
+@click.option("--chunk-frames", type=click.IntRange(min=100), default=5000, show_default=True)
+@click.option("--overlap-frames", type=click.IntRange(min=0), default=1000, show_default=True)
+@click.option(
+    "--min-tail-frames",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Keep a short final chunk only above this size; default is half of --chunk-frames.",
+)
+@click.option(
+    "--prepare-workers",
+    type=click.IntRange(min=1),
+    default=2,
+    show_default=True,
+    help="Concurrent ffmpeg chunk/RGB producers per batch process.",
+)
+@click.option("--ffmpeg-threads", type=click.IntRange(min=1), default=2, show_default=True)
+@click.option(
+    "--max-videos",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help="Maximum claims for this process; 0 scans the complete URL list.",
+)
+@click.option("--keep-local-results", is_flag=True, help="Do not clean uploaded chunks or source videos.")
+@click.option("--stale-lock-hours", type=click.FloatRange(min=0.1), default=6.0, show_default=True)
+@click.option("--worker-id", default=None, help="Optional stable name written to shared state.")
+@click.option("--rclone-bin", default="rclone", show_default=True)
+@click.option("--rclone-transfers", type=click.IntRange(min=1), default=16, show_default=True)
+@click.option("--rclone-checkers", type=click.IntRange(min=1), default=32, show_default=True)
+@click.option(
+    "--rclone-extra-arg",
+    "rclone_extra_args",
+    multiple=True,
+    help="Extra rclone argument; repeat the option for multiple arguments.",
+)
+@click.option("--fail-fast", is_flag=True, help="Stop this process on its first failed video.")
+@_common_depth_options
+@_common_map_options
+def batch_run_command(
+    urls_file: Path,
+    processing_root: Path,
+    remote_output: str,
+    state_file: Path,
+    source_remote: str,
+    pipeline: str,
+    chunk_frames: int,
+    overlap_frames: int,
+    min_tail_frames: int | None,
+    prepare_workers: int,
+    ffmpeg_threads: int,
+    max_videos: int,
+    keep_local_results: bool,
+    stale_lock_hours: float,
+    worker_id: str | None,
+    rclone_bin: str,
+    rclone_transfers: int,
+    rclone_checkers: int,
+    rclone_extra_args: tuple[str, ...],
+    fail_fast: bool,
+    depth_preset: str,
+    dav3_model: str | None,
+    dav3_model_path: Path | None,
+    depth_frame_step: int | None,
+    dav3_process_res: int | None,
+    dav3_resize_method: str | None,
+    depth_output_resolution: str | None,
+    depth_shard_size: int,
+    **map_kwargs,
+) -> None:
+    """Claim URL-list videos, process independent chunks, and upload results."""
+
+    try:
+        dense_depth = _depth_options(
+            depth_preset,
+            dav3_model,
+            dav3_model_path,
+            depth_frame_step,
+            dav3_process_res,
+            dav3_resize_method,
+            depth_output_resolution,
+            depth_shard_size,
+        )
+        summary = run_batch_worker(
+            urls_file,
+            processing_root,
+            remote_output,
+            state_file=state_file,
+            source_remote=source_remote,
+            chunk_frames=chunk_frames,
+            overlap_frames=overlap_frames,
+            min_tail_frames=min_tail_frames,
+            pipeline=pipeline,
+            depth_options=dense_depth,
+            map_options=_map_options(
+                default_frame_step=(
+                    dense_depth.frame_step
+                    if dense_depth.frame_step > 1
+                    else 5
+                ),
+                **map_kwargs,
+            ),
+            prepare_workers=prepare_workers,
+            ffmpeg_threads=ffmpeg_threads,
+            max_videos=max_videos,
+            keep_local_results=keep_local_results,
+            stale_lock_hours=stale_lock_hours,
+            worker_id=worker_id,
+            rclone_binary=rclone_bin,
+            rclone_transfers=rclone_transfers,
+            rclone_checkers=rclone_checkers,
+            rclone_extra_args=rclone_extra_args,
+            fail_fast=fail_fast,
+        )
+        click.echo(json.dumps(summary, indent=2, sort_keys=True))
+    except (
+        ValueError,
+        FileNotFoundError,
+        RuntimeError,
+        NotImplementedError,
+        subprocess.CalledProcessError,
+    ) as exc:
         raise click.ClickException(str(exc)) from exc
 
 
