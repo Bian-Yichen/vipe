@@ -333,13 +333,6 @@ def chunked_run_command(
     default=None,
     help="Keep a short final chunk only above this size; default is half of --chunk-frames.",
 )
-@click.option(
-    "--prepare-workers",
-    type=click.IntRange(min=1),
-    default=2,
-    show_default=True,
-    help="Concurrent ffmpeg chunk/RGB producers per batch process.",
-)
 @click.option("--ffmpeg-threads", type=click.IntRange(min=1), default=2, show_default=True)
 @click.option(
     "--max-videos",
@@ -348,7 +341,6 @@ def chunked_run_command(
     show_default=True,
     help="Maximum claims for this process; 0 scans the complete URL list.",
 )
-@click.option("--keep-local-results", is_flag=True, help="Do not clean uploaded chunks or source videos.")
 @click.option("--stale-lock-hours", type=click.FloatRange(min=0.1), default=6.0, show_default=True)
 @click.option("--worker-id", default=None, help="Optional stable name written to shared state.")
 @click.option("--rclone-bin", default="rclone", show_default=True)
@@ -373,10 +365,8 @@ def batch_run_command(
     chunk_frames: int,
     overlap_frames: int,
     min_tail_frames: int | None,
-    prepare_workers: int,
     ffmpeg_threads: int,
     max_videos: int,
-    keep_local_results: bool,
     stale_lock_hours: float,
     worker_id: str | None,
     rclone_bin: str,
@@ -426,10 +416,8 @@ def batch_run_command(
                 ),
                 **map_kwargs,
             ),
-            prepare_workers=prepare_workers,
             ffmpeg_threads=ffmpeg_threads,
             max_videos=max_videos,
-            keep_local_results=keep_local_results,
             stale_lock_hours=stale_lock_hours,
             worker_id=worker_id,
             rclone_binary=rclone_bin,

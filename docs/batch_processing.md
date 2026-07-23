@@ -24,15 +24,17 @@ python -m vipe_roomtour.cli batch-run \
   --chunk-frames 5000 \
   --overlap-frames 1000 \
   --depth-preset preview \
-  --prepare-workers 2 \
   --ffmpeg-threads 2 \
   --rclone-transfers 200 \
   --rclone-checkers 200 \
   --rclone-extra-arg=--s3-no-check-bucket
 ```
 
-Use a different local `PROCESSING_ROOT` for each concurrently launched process,
-but pass the same URL file, state file, source remote, and output remote.
+You may use the same absolute `PROCESSING_ROOT` for every independently
+launched command. Downloads, manifests, and chunk directories are namespaced
+by `VIDEO_ID`, while the shared lease prevents two workers from processing the
+same video. Every command still runs one batch worker and processes its claimed
+videos sequentially.
 
 ## Chunk rule
 
@@ -84,23 +86,31 @@ shared state file. Other workers that cannot acquire that lease skip the video
 and continue scanning. A heartbeat keeps long VIPE jobs alive; abandoned leases
 can be reclaimed after `--stale-lock-hours`.
 
+Inside one worker, exactly one splitter thread prepares `video.mp4` and `RGB/`
+for upcoming chunks. The main worker consumes those chunks and runs one SLAM
+job at a time. The queue holds at most one prepared chunk, so ffmpeg work can
+overlap SLAM without starting concurrent SLAM jobs or allowing local disk usage
+to grow without a bound.
+
 The completion sequence is:
 
 1. upload every complete chunk;
 2. upload the video manifest;
-3. append a durable `success` record to the shared JSONL and create a done
-   marker while still holding the lease;
-4. release the lease;
-5. clean the local download and chunk directories.
+3. while still holding the lease, delete every local source, manifest, partial
+   download, and chunk directory belonging to this `VIDEO_ID`;
+4. append a durable `success` record to the shared JSONL and create a done
+   marker;
+5. release the lease.
 
-This order prevents a second process from claiming the video between unlock and
-completion recording. Missing remote MP4s are recorded as `missing_remote` and
-will not be scanned again.
+Cleanup never deletes another video's paths, so workers sharing
+`PROCESSING_ROOT` remain isolated. The common `temp/` and `result/` directories
+are removed only when empty. This order also prevents a second process from
+claiming the video between unlock and completion recording. Missing remote MP4s
+are cleaned, recorded as `missing_remote`, and will not be scanned again.
 
 Failed processing or upload attempts are written to
 `.STATE_FILE.state/failures.jsonl`, are not marked complete, and remain
 retryable in a later invocation. Partial local chunk outputs are retained for
 resume. Use `--fail-fast` when one failure should terminate the worker.
 
-By default, successfully uploaded local data is deleted. Add
-`--keep-local-results` for debugging.
+Successfully uploaded local data is always deleted to release disk space.

@@ -9,18 +9,19 @@ import fcntl
 import json
 import logging
 import os
+import queue
+import re
 import shutil
 import socket
 import subprocess
 import threading
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .depth_options import DenseDepthOptions
@@ -722,48 +723,64 @@ def _prepare_and_process_chunks(
     specs: list[ChunkSpec],
     video_info: dict[str, Any],
     *,
-    prepare_workers: int,
     ffmpeg_threads: int,
     pipeline: str,
     depth_options: DenseDepthOptions,
     map_options: MapOptions,
 ) -> list[Path]:
+    """Pipeline one splitter thread into one sequential SLAM consumer."""
+
     result_root = processing_root / "result"
     result_root.mkdir(parents=True, exist_ok=True)
-    iterator: Iterator[ChunkSpec] = iter(specs)
-    active: dict[Future[Path], ChunkSpec] = {}
+    prepared: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+    stop = threading.Event()
     completed: list[Path] = []
 
-    def submit_next(executor: ThreadPoolExecutor) -> bool:
-        try:
-            spec = next(iterator)
-        except StopIteration:
-            return False
-        future = executor.submit(
-            _prepare_chunk,
-            source_video,
-            result_root,
-            video_id,
-            spec,
-            video_info,
-            ffmpeg_threads=ffmpeg_threads,
-        )
-        active[future] = spec
-        return True
+    def put_message(kind: str, payload: Any) -> bool:
+        while not stop.is_set():
+            try:
+                prepared.put((kind, payload), timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
 
-    with ThreadPoolExecutor(
-        max_workers=prepare_workers,
-        thread_name_prefix=f"prepare-{video_id}",
-    ) as executor:
-        for _ in range(min(prepare_workers, len(specs))):
-            submit_next(executor)
-        while active:
-            done, _ = wait(active, return_when=FIRST_COMPLETED)
-            future = next(iter(done))
-            active.pop(future)
-            submit_next(executor)
-            chunk_dir = future.result()
-            # The next CPU preparation runs while this GPU-heavy stage runs.
+    def produce_chunks() -> None:
+        try:
+            for spec in specs:
+                if stop.is_set():
+                    return
+                chunk_dir = _prepare_chunk(
+                    source_video,
+                    result_root,
+                    video_id,
+                    spec,
+                    video_info,
+                    ffmpeg_threads=ffmpeg_threads,
+                )
+                if not put_message("chunk", chunk_dir):
+                    return
+        except BaseException as exc:
+            put_message("error", exc)
+        finally:
+            put_message("done", None)
+
+    producer = threading.Thread(
+        target=produce_chunks,
+        name=f"split-{video_id}",
+        daemon=True,
+    )
+    producer.start()
+    try:
+        while True:
+            kind, payload = prepared.get()
+            if kind == "done":
+                break
+            if kind == "error":
+                raise payload
+            chunk_dir = payload
+            # At most one following chunk is prepared while this GPU-heavy
+            # stage runs, keeping local disk growth bounded.
             _run_chunk_slam(
                 chunk_dir,
                 pipeline=pipeline,
@@ -771,6 +788,10 @@ def _prepare_and_process_chunks(
                 map_options=map_options,
             )
             completed.append(chunk_dir)
+    finally:
+        stop.set()
+        producer.join()
+
     completed.sort()
     return completed
 
@@ -839,6 +860,50 @@ def _upload_video_results(
     return manifest
 
 
+def _cleanup_local_video(processing_root: Path, video_id: str) -> None:
+    """Delete only local artifacts belonging to one successfully uploaded video."""
+
+    processing_root = Path(processing_root)
+    result_root = processing_root / "result"
+    temporary_root = processing_root / "temp"
+    chunk_pattern = re.compile(
+        rf"{re.escape(video_id)}_\d{{6,}}_\d{{6,}}\.mp4"
+    )
+
+    if result_root.is_dir():
+        for candidate in result_root.iterdir():
+            if not chunk_pattern.fullmatch(candidate.name):
+                continue
+            if candidate.is_dir() and not candidate.is_symlink():
+                shutil.rmtree(candidate)
+            else:
+                candidate.unlink(missing_ok=True)
+
+    temporary_paths = [
+        temporary_root / f"{video_id}.mp4",
+        temporary_root / f"{video_id}_manifest.json",
+    ]
+    if temporary_root.is_dir():
+        temporary_paths.extend(
+            temporary_root.glob(f".{video_id}.*.part")
+        )
+        temporary_paths.extend(
+            temporary_root.glob(
+                f".{video_id}_manifest.json.*.tmp"
+            )
+        )
+    for candidate in temporary_paths:
+        candidate.unlink(missing_ok=True)
+
+    # These roots are shared by all workers. Remove them only when they are
+    # empty; concurrent workers' files make rmdir fail harmlessly.
+    for shared_root in (result_root, temporary_root):
+        try:
+            shared_root.rmdir()
+        except (FileNotFoundError, OSError):
+            pass
+
+
 def run_batch_worker(
     urls_file: Path,
     processing_root: Path,
@@ -852,10 +917,8 @@ def run_batch_worker(
     pipeline: str,
     depth_options: DenseDepthOptions,
     map_options: MapOptions,
-    prepare_workers: int = 2,
     ffmpeg_threads: int = 2,
     max_videos: int = 0,
-    keep_local_results: bool = False,
     stale_lock_hours: float = 6.0,
     worker_id: str | None = None,
     rclone_binary: str = "rclone",
@@ -872,8 +935,8 @@ def run_batch_worker(
         raise ValueError("PROCESSING_ROOT must be an absolute path")
     if not state_file.is_absolute():
         raise ValueError("--state-file must be an absolute shared path")
-    if prepare_workers < 1 or ffmpeg_threads < 1:
-        raise ValueError("prepare_workers and ffmpeg_threads must be >= 1")
+    if ffmpeg_threads < 1:
+        raise ValueError("ffmpeg_threads must be >= 1")
     entries = load_url_entries(urls_file)
     worker_id = worker_id or (
         f"{socket.gethostname()}:{os.getpid()}:"
@@ -940,17 +1003,35 @@ def run_batch_worker(
         summary["claimed"] += 1
         with claim:
             if f"{video_id}.mp4" not in remote_files:
-                state.mark_terminal(
-                    video_id=video_id,
-                    url=url,
-                    status="missing_remote",
-                    details={
-                        "source_remote": source_remote,
-                        "remote_output": remote_output,
-                    },
-                )
-                summary["missing_remote"] += 1
-                logger.warning("Remote video does not exist; marked missing: %s", video_id)
+                try:
+                    _cleanup_local_video(processing_root, video_id)
+                    state.mark_terminal(
+                        video_id=video_id,
+                        url=url,
+                        status="missing_remote",
+                        details={
+                            "source_remote": source_remote,
+                            "remote_output": remote_output,
+                        },
+                    )
+                    summary["missing_remote"] += 1
+                    logger.warning(
+                        "Remote video does not exist; marked missing: %s",
+                        video_id,
+                    )
+                except Exception as exc:
+                    summary["failed"] += 1
+                    state.record_failure(
+                        video_id=video_id,
+                        url=url,
+                        error=exc,
+                    )
+                    logger.exception(
+                        "Could not clean/record missing video %s; it remains retryable",
+                        video_id,
+                    )
+                    if fail_fast:
+                        raise
                 continue
             try:
                 source_video = _download_video(
@@ -978,13 +1059,12 @@ def run_batch_worker(
                     video_id,
                     specs,
                     video_info,
-                    prepare_workers=prepare_workers,
                     ffmpeg_threads=ffmpeg_threads,
                     pipeline=pipeline,
                     depth_options=depth_options,
                     map_options=map_options,
                 )
-                local_manifest = _upload_video_results(
+                _upload_video_results(
                     rclone,
                     chunk_dirs=chunk_dirs,
                     remote_output=remote_output,
@@ -993,6 +1073,8 @@ def run_batch_worker(
                     url=url,
                     video_info=video_info,
                 )
+                chunk_names = [path.name for path in chunk_dirs]
+                _cleanup_local_video(processing_root, video_id)
                 state.mark_terminal(
                     video_id=video_id,
                     url=url,
@@ -1002,22 +1084,10 @@ def run_batch_worker(
                         "remote_output": remote_output,
                         "total_frames": video_info["total_frames"],
                         "chunk_count": len(chunk_dirs),
-                        "chunks": [path.name for path in chunk_dirs],
+                        "chunks": chunk_names,
                     },
                 )
                 summary["success"] += 1
-                if not keep_local_results:
-                    try:
-                        for chunk_dir in chunk_dirs:
-                            shutil.rmtree(chunk_dir, ignore_errors=True)
-                        source_video.unlink(missing_ok=True)
-                        local_manifest.unlink(missing_ok=True)
-                    except OSError:
-                        # Upload and durable completion already succeeded.
-                        logger.exception(
-                            "Could not fully clean local files for %s",
-                            video_id,
-                        )
             except Exception as exc:
                 summary["failed"] += 1
                 state.record_failure(
