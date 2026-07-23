@@ -28,6 +28,9 @@ backend_iters: 24
 # numerically unchanged unless explicitly requested by the room-tour CLI.
 loop_closure:
   enabled: false
+  # normal preserves v3 behavior. The other values are explicit diagnostics
+  # exposed by vipe-roomtour's --loop-experiment flag.
+  experiment_mode: normal
   min_frame_gap: 300
   min_keyframe_gap: 12
   retrieval_top_k: 4
@@ -61,6 +64,9 @@ loop_closure:
   min_switch_weight: 0.25
   pose_graph_max_local_change: 0.35
   pose_graph_max_nfev: 60
+  hinge_window_radius: 3
+  hinge_search_margin: 3
+  hinge_transition_radius: 8
   # v3: viewpoint-invariant registration of short SLAM point-cloud windows.
   submap_filter_thresh: 0.05
   submap_radius_small: 3

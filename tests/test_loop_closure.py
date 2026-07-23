@@ -6,6 +6,7 @@ import torch
 from vipe.slam.components.loop_closure import (
     LoopClosureOptions,
     LoopConstraint,
+    _constraint_world_correction,
     _optimize_pose_graph_matrices,
     _retrieval_descriptors,
     _sequence_score,
@@ -69,6 +70,23 @@ def test_sequence_score_recognizes_reverse_traversal() -> None:
 
     assert direction == -1
     assert score > 0.84
+
+
+def test_image_loop_converts_to_target_leg_world_correction() -> None:
+    w2c = np.repeat(np.eye(4)[None], 3, axis=0)
+    w2c[2, 0, 3] = -1.0
+    measurement = np.eye(4)
+    constraint = _constraint(0, 2, measurement)
+
+    correction = _constraint_world_correction(constraint, w2c)
+    corrected_target_w2c = np.linalg.inv(
+        correction @ np.linalg.inv(w2c[constraint.target])
+    )
+    corrected_relative = (
+        corrected_target_w2c @ np.linalg.inv(w2c[constraint.source])
+    )
+
+    assert np.allclose(corrected_relative, measurement)
 
 
 def test_pose_graph_distributes_a_verified_loop_correction() -> None:

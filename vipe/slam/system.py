@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import uuid
 
 import numpy as np
@@ -38,6 +39,8 @@ from .components.inner_filler import FilledReturn, InnerFiller
 from .components.motion_filter import MotionFilter
 from .components.sparse_tracks import build_sparse_tracks
 from .interface import SLAMOutput
+
+logger = logging.getLogger(__name__)
 from .networks.droid_net import get_droid_net
 
 
@@ -299,14 +302,44 @@ class SLAMSystem:
         if self.config.loop_closure.enabled:
             loop_edges = self.backend.detect_and_correct_loops()
 
-        # Rebuild the dense graph from corrected poses and explicitly retain
-        # verified loop pairs for the final DROID bundle adjustment.
-        self.backend.run(
-            self.config.backend_iters,
-            update_depth=False,
-            log=self.visualize,
-            extra_edges=loop_edges,
+        loop_experiment = str(
+            getattr(self.config.loop_closure, "experiment_mode", "normal")
         )
+        loop_report = self.backend.last_loop_report
+        skip_final_backend = False
+        if loop_report is not None:
+            if loop_experiment == "skip-final-ba":
+                skip_final_backend = bool(
+                    (loop_report.get("pose_graph") or {}).get(
+                        "applied",
+                        False,
+                    )
+                    and loop_report.get("accepted_loop_edges", 0) > 0
+                )
+            elif loop_experiment == "hinge-warp":
+                skip_final_backend = bool(
+                    (loop_report.get("hinge_warp") or {}).get(
+                        "applied",
+                        False,
+                    )
+                )
+            loop_report["final_backend_ba_skipped"] = skip_final_backend
+
+        if skip_final_backend:
+            logger.info(
+                "Loop experiment '%s' preserved the corrected keyframe poses; "
+                "skipping the final unconstrained DROID backend BA",
+                loop_experiment,
+            )
+        else:
+            # Rebuild the dense graph from corrected poses and explicitly
+            # retain image-verified loop pairs for the final DROID BA.
+            self.backend.run(
+                self.config.backend_iters,
+                update_depth=False,
+                log=self.visualize,
+                extra_edges=loop_edges,
+            )
         if self.config.loop_closure.enabled:
             self.backend.finalize_loop_report()
 

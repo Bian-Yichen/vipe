@@ -16,7 +16,7 @@ import numpy as np
 from .depth_options import DenseDepthOptions
 from .geometry import intrinsics_matrix
 
-LOOP_CLOSURE_CACHE_VERSION = 3
+LOOP_CLOSURE_CACHE_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -74,7 +74,11 @@ class ArtifactSet:
         if missing:
             raise FileNotFoundError("Missing VIPE artifacts: " + ", ".join(str(p) for p in missing))
 
-    def slam_matches(self, loop_closure: bool) -> bool:
+    def slam_matches(
+        self,
+        loop_closure: bool,
+        loop_experiment: str = "normal",
+    ) -> bool:
         try:
             self.validate_calibration()
             with self.info.open("rb") as handle:
@@ -84,11 +88,26 @@ class ArtifactSet:
                 not loop_closure
                 or int(metadata.get("loop_closure_version", 0)) == LOOP_CLOSURE_CACHE_VERSION
             )
-            return enabled_matches and version_matches
+            experiment_matches = (
+                not loop_closure
+                or str(metadata.get("loop_closure_experiment", "normal"))
+                == loop_experiment
+            )
+            return (
+                enabled_matches
+                and version_matches
+                and experiment_matches
+            )
         except (FileNotFoundError, OSError, EOFError, pickle.UnpicklingError, TypeError):
             return False
 
-    def depth_matches(self, options: DenseDepthOptions, *, loop_closure: bool = False) -> bool:
+    def depth_matches(
+        self,
+        options: DenseDepthOptions,
+        *,
+        loop_closure: bool = False,
+        loop_experiment: str = "normal",
+    ) -> bool:
         if not all(path.exists() for path in (self.rgb, self.depth, self.pose, self.intrinsics)):
             return False
         if not self.depth_metadata.exists():
@@ -106,9 +125,13 @@ class ArtifactSet:
                 **options.inference_config(),
                 "slam_loop_closure": bool(loop_closure),
                 "slam_loop_closure_version": LOOP_CLOSURE_CACHE_VERSION if loop_closure else 0,
+                "slam_loop_experiment": (
+                    loop_experiment if loop_closure else "normal"
+                ),
             }
             saved.setdefault("slam_loop_closure", False)
             saved.setdefault("slam_loop_closure_version", 0)
+            saved.setdefault("slam_loop_experiment", "normal")
             return saved == expected
         except (OSError, ValueError, TypeError):
             return False

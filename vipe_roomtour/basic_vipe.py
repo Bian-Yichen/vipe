@@ -20,6 +20,7 @@ def build_pipeline(
     save_viz: bool = False,
     depth_options: DenseDepthOptions | None = None,
     loop_closure: bool = False,
+    loop_experiment: str = "normal",
 ):
     """Construct the bounded-memory annotation pipeline without Hydra."""
 
@@ -36,12 +37,15 @@ def build_pipeline(
         raise ValueError(f"Unsupported minimal pipeline '{pipeline_name}'. Choose one of: {choices}")
     keyframe_depth, dense_depth = presets[pipeline_name]
     depth_options = depth_options or DenseDepthOptions.from_preset("quality")
+    if loop_experiment != "normal" and not loop_closure:
+        raise ValueError("loop_experiment requires loop_closure=True")
 
     slam = OmegaConf.load(get_config_path() / "slam" / "default.yaml")
     slam.optimize_intrinsics = True
     slam.keyframe_depth = keyframe_depth
     slam.visualize = False
     slam.loop_closure.enabled = bool(loop_closure)
+    slam.loop_closure.experiment_mode = str(loop_experiment)
 
     init = OmegaConf.create(
         {
@@ -93,6 +97,7 @@ def run_inference(
     mode: str = "full",
     depth_options: DenseDepthOptions | None = None,
     loop_closure: bool = False,
+    loop_experiment: str = "normal",
 ) -> None:
     """Decode one continuous video and run the minimal static-scene pipeline."""
 
@@ -126,6 +131,7 @@ def run_inference(
         save_viz=save_viz,
         depth_options=depth_options,
         loop_closure=loop_closure,
+        loop_experiment=loop_experiment,
     )
     pipeline.run_mode(stream, mode=mode, frame_index_offset=0 if start_frame is None else int(start_frame))
     logger.info("Finished minimal VIPE inference")
@@ -151,6 +157,12 @@ def main() -> None:
         action="store_true",
         help="Enable geometry-verified long-range loop closure inside this SLAM solve",
     )
+    parser.add_argument(
+        "--loop-experiment",
+        choices=("normal", "skip-final-ba", "hinge-warp"),
+        default="normal",
+        help="How to preserve or localize a verified loop correction",
+    )
     parser.add_argument("--depth-preset", choices=("preview", "balanced", "quality"), default="quality")
     parser.add_argument("--dav3-model", choices=("giant", "large", "base", "small"), default=None)
     parser.add_argument(
@@ -170,6 +182,8 @@ def main() -> None:
     args = parser.parse_args()
     if not args.video.is_file():
         parser.error(f"Video does not exist: {args.video}")
+    if args.loop_experiment != "normal" and not args.loop_closure:
+        parser.error("--loop-experiment requires --loop-closure")
     depth_options = DenseDepthOptions.from_preset(
         args.depth_preset,
         model=args.dav3_model,
@@ -191,6 +205,7 @@ def main() -> None:
         mode=args.mode,
         depth_options=depth_options,
         loop_closure=args.loop_closure,
+        loop_experiment=args.loop_experiment,
     )
 
 

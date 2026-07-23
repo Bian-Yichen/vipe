@@ -180,7 +180,7 @@ python -m vipe_roomtour.cli chunked-run /data/villa.mp4 /data/output/villa_loop 
   --pose-only --loop-closure
 ```
 
-This keeps the stock frontend and backend, then runs loop-closure v3 before the
+This keeps the stock frontend and backend, then runs loop-closure v4 before the
 final DROID bundle adjustment:
 
 1. Build a hybrid place descriptor from the existing DROID feature pyramid and
@@ -212,14 +212,14 @@ final DROID bundle adjustment:
    correction that actually survives into exported per-frame poses, rather than
    only the intermediate pose-graph result.
 
-The v3 retrieval and verification code uses OpenCV, NumPy/SciPy, and features
+The v4 retrieval and verification code uses OpenCV, NumPy/SciPy, and features
 and SLAM depth already present in ViPE; it does not download an additional
 neural-network checkpoint.
 
 The mode is opt-in: omitting `--loop-closure` executes the previous solver.
 Loop and non-loop checkpoints/depth are tagged separately. The algorithm
 version is tagged as well, so a directory produced by loop-closure v1 is
-automatically invalidated and recomputed by v3 instead of being silently reused.
+automatically invalidated and recomputed by v4 instead of being silently reused.
 For an A/B test, use different output directories and compare pose-only first:
 
 ```bash
@@ -251,6 +251,31 @@ This experiment targets pose drift. Rolling shutter, severe lens distortion,
 or inconsistent dense DAv3 depth can still leave wall thickness even after a
 correct loop. Repeated texture is why appearance similarity alone is never
 allowed to modify a pose.
+
+### Stair U-turn isolation experiments
+
+When the outbound and return legs are each sharp but are rotated relative to
+one another, run these two modes in separate new output directories:
+
+```bash
+# Experiment A: preserve the verified pose-graph correction and skip the final
+# DROID BA that has no persistent factor for opposite-view submap loops.
+python -m vipe_roomtour.cli chunked-run INPUT.mp4 OUTPUT_skip_final_ba \
+  --chunk-frames 5000 --overlap-frames 500 --depth-preset preview \
+  --loop-closure --loop-experiment skip-final-ba
+
+# Experiment B: find the high-rotation/low-translation U-turn automatically,
+# keep both legs rigid, and blend the loop correction only around that hinge.
+python -m vipe_roomtour.cli chunked-run INPUT.mp4 OUTPUT_hinge_warp \
+  --chunk-frames 5000 --overlap-frames 500 --depth-preset preview \
+  --loop-closure --loop-experiment hinge-warp
+```
+
+`hinge-warp` also skips the final unconstrained DROID BA. Its loop JSON records
+the selected anchor pair, supporting constraints, detected hinge keyframes and
+source-frame numbers, applied world correction, and every sanity check.
+`normal`, `skip-final-ba`, and `hinge-warp` have different cache identities, so
+one experiment cannot silently reuse another experiment's poses or depth.
 
 This accepts any input resolution supported by VIPE (720p, 1080p, and so on).
 VIPE writes intrinsics in the original RGB pixel grid. If dense depth uses a

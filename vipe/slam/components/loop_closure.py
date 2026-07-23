@@ -29,6 +29,7 @@ from vipe.ext.lietorch import SE3
 from vipe.utils.geometry import se3_matrix_to_se3
 
 from .buffer import GraphBuffer
+from .hinge_correction import apply_hinge_correction, detect_rotation_hinge
 from .submap_registration import (
     SubmapRegistrationOptions,
     independent_transform_support,
@@ -37,11 +38,12 @@ from .submap_registration import (
 
 logger = logging.getLogger(__name__)
 
-LOOP_CLOSURE_VERSION = 3
+LOOP_CLOSURE_VERSION = 4
 
 
 @dataclass(frozen=True)
 class LoopClosureOptions:
+    experiment_mode: str = "normal"
     # Require a genuinely long revisit.  Raw-frame and keyframe gaps are both
     # needed because a nearly stationary camera can produce very sparse
     # keyframes over hundreds of decoded frames.
@@ -82,6 +84,9 @@ class LoopClosureOptions:
     min_switch_weight: float = 0.25
     pose_graph_max_local_change: float = 0.35
     pose_graph_max_nfev: int = 60
+    hinge_window_radius: int = 3
+    hinge_search_margin: int = 3
+    hinge_transition_radius: int = 8
     submap_filter_thresh: float = 0.05
     submap_radius_small: int = 3
     submap_radius_large: int = 5
@@ -1097,14 +1102,213 @@ def _pose_graph_optimize(
     buffer: GraphBuffer,
     constraints: list[LoopConstraint],
     options: LoopClosureOptions,
+    *,
+    apply_correction: bool = True,
 ) -> dict[str, Any]:
     original, _ = _w2c_and_centers(buffer)
     corrected, report = _optimize_pose_graph_matrices(original, constraints, options)
-    if report["applied"]:
+    correction_applied = bool(report["applied"] and apply_correction)
+    if correction_applied:
         corrected_se3 = se3_matrix_to_se3(corrected.astype(np.float32)).data.to(buffer.device)
         buffer.poses[: buffer.n_frames] = corrected_se3
         buffer.dirty[: buffer.n_frames] = True
+    report["correction_applied_to_buffer"] = correction_applied
     return report
+
+
+def _constraint_world_correction(
+    constraint: LoopConstraint,
+    w2c: np.ndarray,
+) -> np.ndarray:
+    """Return the world transform that moves the target leg onto the source leg."""
+
+    if constraint.world_correction is not None:
+        return np.asarray(constraint.world_correction, dtype=np.float64)
+    # M = W2C_target' @ C2W_source and C2W_target' = D @ C2W_target.
+    # Therefore D = C2W_source @ inv(M) @ W2C_target.
+    return (
+        np.linalg.inv(w2c[constraint.source])
+        @ np.linalg.inv(constraint.target_from_source)
+        @ w2c[constraint.target]
+    )
+
+
+def _mean_world_correction(
+    corrections: list[np.ndarray],
+    weights: np.ndarray,
+) -> np.ndarray:
+    weights = np.asarray(weights, dtype=np.float64)
+    weights = weights / max(float(weights.sum()), 1e-12)
+    result = np.eye(4, dtype=np.float64)
+    result[:3, :3] = Rotation.from_matrix(
+        np.stack([item[:3, :3] for item in corrections])
+    ).mean(weights=weights).as_matrix()
+    result[:3, 3] = np.average(
+        np.stack([item[:3, 3] for item in corrections]),
+        axis=0,
+        weights=weights,
+    )
+    return result
+
+
+def _apply_hinge_warp(
+    buffer: GraphBuffer,
+    constraints: list[LoopConstraint],
+    switch_weights: list[float],
+    options: LoopClosureOptions,
+    timestamps: np.ndarray,
+    original_w2c: np.ndarray,
+) -> dict[str, Any]:
+    """Apply one consensus loop correction around the most likely U-turn."""
+
+    if not constraints:
+        return {
+            "applied": False,
+            "rejection_reasons": ["no_robust_loop_constraints"],
+        }
+
+    corrections = [
+        _constraint_world_correction(constraint, original_w2c)
+        for constraint in constraints
+    ]
+    severities = np.asarray(
+        [
+            (
+                constraint.current_translation_error
+                + 0.05 * constraint.current_rotation_error_deg
+            )
+            * max(float(switch_weight), 1e-3)
+            for constraint, switch_weight in zip(
+                constraints,
+                switch_weights,
+                strict=True,
+            )
+        ],
+        dtype=np.float64,
+    )
+    seed_index = int(np.argmax(severities))
+    seed = constraints[seed_index]
+    seed_correction = corrections[seed_index]
+    supporters = []
+    for index, (constraint, correction) in enumerate(
+        zip(constraints, corrections, strict=True)
+    ):
+        transform_delta = np.linalg.inv(seed_correction) @ correction
+        rotation_delta = _rotation_degrees(transform_delta)
+        translation_delta = float(np.linalg.norm(transform_delta[:3, 3]))
+        nearby = (
+            abs(constraint.source - seed.source) <= 2 * options.cluster_radius
+            and abs(constraint.target - seed.target) <= 2 * options.cluster_radius
+        )
+        consistent = (
+            rotation_delta <= options.submap_rotation_consistency_deg
+            and translation_delta <= options.submap_translation_consistency
+        )
+        if nearby and consistent:
+            supporters.append(index)
+    if not supporters:
+        supporters = [seed_index]
+
+    support_weights = np.asarray(
+        [
+            max(float(switch_weights[index]), 1e-3)
+            * max(float(constraints[index].score), 1e-3)
+            for index in supporters
+        ],
+        dtype=np.float64,
+    )
+    consensus = _mean_world_correction(
+        [corrections[index] for index in supporters],
+        support_weights,
+    )
+    source = int(
+        round(
+            np.average(
+                [constraints[index].source for index in supporters],
+                weights=support_weights,
+            )
+        )
+    )
+    target = int(
+        round(
+            np.average(
+                [constraints[index].target for index in supporters],
+                weights=support_weights,
+            )
+        )
+    )
+    source = max(0, min(source, len(original_w2c) - 2))
+    target = max(source + 1, min(target, len(original_w2c) - 1))
+    hinge = detect_rotation_hinge(
+        original_w2c,
+        source,
+        target,
+        window_radius=options.hinge_window_radius,
+        search_margin=options.hinge_search_margin,
+    )
+    corrected, correction_report = apply_hinge_correction(
+        original_w2c,
+        consensus,
+        hinge.hinge_edge,
+        transition_radius=options.hinge_transition_radius,
+    )
+    checks = {
+        "finite": bool(np.all(np.isfinite(corrected))),
+        "correction_rotation_within_limit": (
+            _rotation_degrees(consensus)
+            <= options.max_pose_correction_rotation_deg
+        ),
+        "correction_translation_within_limit": (
+            float(np.linalg.norm(consensus[:3, 3]))
+            <= options.max_pose_correction_translation
+        ),
+        "local_odometry_change_within_limit": (
+            correction_report["max_local_odometry_change"]
+            <= options.pose_graph_max_local_change
+        ),
+    }
+    applied = all(checks.values())
+    if applied:
+        corrected_se3 = se3_matrix_to_se3(
+            corrected.astype(np.float32)
+        ).data.to(buffer.device)
+        buffer.poses[: buffer.n_frames] = corrected_se3
+        buffer.dirty[: buffer.n_frames] = True
+
+    return {
+        "applied": applied,
+        "seed_constraint": seed.to_dict(),
+        "supporter_count": len(supporters),
+        "supporter_pairs": [
+            {
+                "source_keyframe": constraints[index].source,
+                "target_keyframe": constraints[index].target,
+                "source_frame": constraints[index].source_frame,
+                "target_frame": constraints[index].target_frame,
+                "switch_weight": float(switch_weights[index]),
+            }
+            for index in supporters
+        ],
+        "consensus_world_correction": consensus.tolist(),
+        "anchor_source_keyframe": source,
+        "anchor_target_keyframe": target,
+        "anchor_source_frame": int(timestamps[source]),
+        "anchor_target_frame": int(timestamps[target]),
+        "hinge_keyframe_edge": [
+            hinge.hinge_edge,
+            hinge.hinge_edge + 1,
+        ],
+        "hinge_source_frames": [
+            int(timestamps[hinge.hinge_edge]),
+            int(timestamps[hinge.hinge_edge + 1]),
+        ],
+        "hinge_detection": hinge.to_dict(),
+        "correction": correction_report,
+        "sanity_checks": checks,
+        "rejection_reasons": [
+            name for name, passed in checks.items() if not passed
+        ],
+    }
 
 
 @torch.no_grad()
@@ -1143,7 +1347,7 @@ def detect_and_correct_loops(
             submap_error = str(exc)
             retrieval_report["spatial_submap_error"] = submap_error
             logger.warning(
-                "Disabling v3 submap verification for this chunk: %s",
+                "Disabling v4 submap verification for this chunk: %s",
                 exc,
             )
     for (
@@ -1310,6 +1514,7 @@ def detect_and_correct_loops(
     report: dict[str, Any] = {
         "version": LOOP_CLOSURE_VERSION,
         "enabled": True,
+        "experiment_mode": options.experiment_mode,
         "options": asdict(options),
         "retrieval": retrieval_report,
         "verification_counts": dict(rejections),
@@ -1321,14 +1526,29 @@ def detect_and_correct_loops(
         "pose_graph_input_edges": [constraint.to_dict() for constraint in retained],
         "candidates": candidate_records,
         "pose_graph": None,
+        "hinge_warp": None,
     }
     if not retained:
         logger.warning(
-            "Loop closure v3 found no verified appearance or submap constraint"
+            "Loop closure v4 found no verified appearance or submap constraint"
         )
         return None, report
 
-    report["pose_graph"] = _pose_graph_optimize(buffer, retained, options)
+    if options.experiment_mode not in {
+        "normal",
+        "skip-final-ba",
+        "hinge-warp",
+    }:
+        raise ValueError(
+            "Unsupported loop-closure experiment mode: "
+            f"{options.experiment_mode}"
+        )
+    report["pose_graph"] = _pose_graph_optimize(
+        buffer,
+        retained,
+        options,
+        apply_correction=options.experiment_mode != "hinge-warp",
+    )
     switch_weights = report["pose_graph"]["robust_loop_switch_weights"]
     minimum_switch = options.min_switch_weight
     for record, switch_weight in zip(
@@ -1338,7 +1558,10 @@ def detect_and_correct_loops(
         record["retained_after_switchable_optimization"] = bool(
             switch_weight >= minimum_switch
         )
-    if not report["pose_graph"]["applied"]:
+    if (
+        options.experiment_mode != "hinge-warp"
+        and not report["pose_graph"]["applied"]
+    ):
         logger.warning(
             "Rejected loop pose-graph correction: %s",
             ", ".join(report["pose_graph"]["rejection_reasons"]),
@@ -1360,10 +1583,26 @@ def detect_and_correct_loops(
     if not robust_retained:
         logger.warning("Loop pose graph downweighted every long-range edge")
         return None, report
+    if options.experiment_mode == "hinge-warp":
+        report["hinge_warp"] = _apply_hinge_warp(
+            buffer,
+            robust_retained,
+            [switch_weight for _, switch_weight in robust_pairs],
+            options,
+            timestamps,
+            w2c,
+        )
+        if not report["hinge_warp"]["applied"]:
+            logger.warning(
+                "Rejected hinge-aware loop correction: %s",
+                ", ".join(report["hinge_warp"]["rejection_reasons"]),
+            )
+            return None, report
     droid_constraints = [
         constraint
         for constraint in robust_retained
         if constraint.add_droid_factor
+        and options.experiment_mode != "hinge-warp"
     ]
     if droid_constraints:
         edges = torch.tensor(
@@ -1376,17 +1615,27 @@ def detect_and_correct_loops(
         )
     else:
         edges = torch.empty((0, 2), dtype=torch.long, device=buffer.device)
+    image_constraints = sum(
+        constraint.add_droid_factor
+        for constraint in robust_retained
+    )
+    submap_constraints = len(robust_retained) - image_constraints
     report["droid_loop_edges"] = len(droid_constraints)
-    report["submap_pose_only_edges"] = (
-        len(robust_retained) - len(droid_constraints)
+    report["image_verified_edges"] = image_constraints
+    report["submap_pose_only_edges"] = submap_constraints
+    report["hinge_pose_only_edges"] = (
+        len(robust_retained)
+        if options.experiment_mode == "hinge-warp"
+        else 0
     )
     logger.info(
-        "Loop closure v3 accepted %d/%d candidates (%d image, %d submap); "
+        "Loop closure v4 (%s) accepted %d/%d candidates (%d image, %d submap); "
         "pose graph cost %.3f -> %.3f",
+        options.experiment_mode,
         len(robust_retained),
         len(candidates),
-        len(droid_constraints),
-        len(robust_retained) - len(droid_constraints),
+        image_constraints,
+        submap_constraints,
         report["pose_graph"]["cost_before"],
         report["pose_graph"]["cost_after"],
     )
@@ -1402,7 +1651,7 @@ def finalize_loop_report(
     report: dict[str, Any] | None,
     reference_w2c: np.ndarray | None,
 ) -> None:
-    """Measure what remains after the final recurrent DROID bundle adjustment."""
+    """Measure the exported keyframe state after the optional final DROID BA."""
 
     if report is None or reference_w2c is None:
         return
@@ -1427,6 +1676,9 @@ def finalize_loop_report(
 
     report["final_dense_ba"] = {
         "measured": True,
+        "backend_ba_skipped": bool(
+            report.get("final_backend_ba_skipped", False)
+        ),
         "median_camera_center_change_from_preloop": float(np.median(center_changes)),
         "max_camera_center_change_from_preloop": float(np.max(center_changes, initial=0.0)),
         "median_accepted_loop_rotation_error_deg": float(np.median(rotation_errors))

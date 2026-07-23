@@ -145,6 +145,16 @@ def main(verbose: bool) -> None:
     is_flag=True,
     help="Enable appearance-retrieved, geometry-verified long-range loop closure inside each SLAM solve.",
 )
+@click.option(
+    "--loop-experiment",
+    type=click.Choice(("normal", "skip-final-ba", "hinge-warp")),
+    default="normal",
+    show_default=True,
+    help=(
+        "normal: standard final BA; skip-final-ba: preserve pose-graph "
+        "correction; hinge-warp: localize correction around an automatic U-turn"
+    ),
+)
 @_common_depth_options
 @_common_map_options
 def run_command(
@@ -159,6 +169,7 @@ def run_command(
     pose_only: bool,
     depth_only: bool,
     loop_closure: bool,
+    loop_experiment: str,
     depth_preset: str,
     dav3_model: str | None,
     dav3_model_path: Path | None,
@@ -174,6 +185,8 @@ def run_command(
     try:
         if pose_only and depth_only:
             raise ValueError("--pose-only and --depth-only are mutually exclusive")
+        if loop_experiment != "normal" and not loop_closure:
+            raise ValueError("--loop-experiment requires --loop-closure")
         dense_depth = _depth_options(
             depth_preset,
             dav3_model,
@@ -201,6 +214,7 @@ def run_command(
             inference_mode="pose" if pose_only else "depth" if depth_only else "full",
             depth_options=dense_depth,
             loop_closure=loop_closure,
+            loop_experiment=loop_experiment,
         )
     except (ValueError, FileNotFoundError, RuntimeError, NotImplementedError, subprocess.CalledProcessError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -238,6 +252,16 @@ def run_command(
     is_flag=True,
     help="Enable long-range loop closure independently inside every chunk.",
 )
+@click.option(
+    "--loop-experiment",
+    type=click.Choice(("normal", "skip-final-ba", "hinge-warp")),
+    default="normal",
+    show_default=True,
+    help=(
+        "normal: standard final BA; skip-final-ba: preserve pose-graph "
+        "correction; hinge-warp: localize correction around an automatic U-turn"
+    ),
+)
 @click.option("--depth-workers", type=click.IntRange(min=1), default=1, show_default=True, help="Parallel DAv3 workers, one per visible GPU.")
 @_common_depth_options
 @_common_map_options
@@ -257,6 +281,7 @@ def chunked_run_command(
     pose_only: bool,
     depth_only: bool,
     loop_closure: bool,
+    loop_experiment: str,
     depth_workers: int,
     depth_preset: str,
     dav3_model: str | None,
@@ -273,6 +298,8 @@ def chunked_run_command(
     try:
         if pose_only and depth_only:
             raise ValueError("--pose-only and --depth-only are mutually exclusive")
+        if loop_experiment != "normal" and not loop_closure:
+            raise ValueError("--loop-experiment requires --loop-closure")
         if min_stitch_scale >= max_stitch_scale:
             raise ValueError("--max-stitch-scale must be greater than --min-stitch-scale")
         dense_depth = _depth_options(
@@ -309,6 +336,7 @@ def chunked_run_command(
             depth_options=dense_depth,
             depth_workers=depth_workers,
             loop_closure=loop_closure,
+            loop_experiment=loop_experiment,
         )
     except (ValueError, FileNotFoundError, RuntimeError, NotImplementedError, subprocess.CalledProcessError) as exc:
         raise click.ClickException(str(exc)) from exc

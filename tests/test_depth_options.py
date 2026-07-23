@@ -96,6 +96,7 @@ def test_artifacts_do_not_cross_reuse_loop_closure_variants(tmp_path: Path) -> N
             {
                 "loop_closure_enabled": True,
                 "loop_closure_version": LOOP_CLOSURE_CACHE_VERSION,
+                "loop_closure_experiment": "skip-final-ba",
             },
             handle,
         )
@@ -105,13 +106,24 @@ def test_artifacts_do_not_cross_reuse_loop_closure_variants(tmp_path: Path) -> N
                 **options.inference_config(),
                 "slam_loop_closure": True,
                 "slam_loop_closure_version": LOOP_CLOSURE_CACHE_VERSION,
+                "slam_loop_experiment": "skip-final-ba",
             }
         )
     )
 
-    assert artifact.slam_matches(True)
+    assert artifact.slam_matches(True, "skip-final-ba")
+    assert not artifact.slam_matches(True, "normal")
     assert not artifact.slam_matches(False)
-    assert artifact.depth_matches(options, loop_closure=True)
+    assert artifact.depth_matches(
+        options,
+        loop_closure=True,
+        loop_experiment="skip-final-ba",
+    )
+    assert not artifact.depth_matches(
+        options,
+        loop_closure=True,
+        loop_experiment="hinge-warp",
+    )
     assert not artifact.depth_matches(options, loop_closure=False)
 
     # A v1 experiment must not silently feed its poses or dense depth into the

@@ -759,6 +759,7 @@ def _run_chunk_depth_jobs(
     depth_options: DenseDepthOptions,
     depth_workers: int,
     loop_closure: bool,
+    loop_experiment: str,
 ) -> None:
     if not jobs:
         return
@@ -781,6 +782,7 @@ def _run_chunk_depth_jobs(
                 depth_options=depth_options,
                 cuda_visible_device=device,
                 loop_closure=loop_closure,
+                loop_experiment=loop_experiment,
             )
         finally:
             devices.put(device)
@@ -820,6 +822,7 @@ def run_chunked_roomtour(
     depth_options: DenseDepthOptions | None = None,
     depth_workers: int = 1,
     loop_closure: bool = False,
+    loop_experiment: str = "normal",
 ) -> dict[str, Any]:
     input_video = Path(input_video).resolve()
     output_root = resolve_output_path(output_root)
@@ -854,6 +857,7 @@ def run_chunked_roomtour(
         "dense_depth": depth_options.to_dict(),
         "depth_workers": depth_workers,
         "loop_closure": bool(loop_closure),
+        "loop_experiment": loop_experiment,
         "chunk_frames": chunk_frames,
         "overlap_frames": overlap_frames,
         "map_options": asdict(map_options),
@@ -864,11 +868,16 @@ def run_chunked_roomtour(
     # Dense DAv3 is not loaded in this phase.
     for spec in specs:
         artifact = ArtifactSet(artifact_root, spec.name)
-        calibration_complete = artifact.slam_matches(loop_closure)
+        calibration_complete = artifact.slam_matches(
+            loop_closure,
+            loop_experiment,
+        )
         if not calibration_complete:
             if skip_inference or inference_mode == "depth":
                 raise FileNotFoundError(
-                    f"Missing SLAM checkpoint matching loop_closure={loop_closure} for {spec.name}"
+                    "Missing SLAM checkpoint matching "
+                    f"loop_closure={loop_closure}, "
+                    f"loop_experiment={loop_experiment} for {spec.name}"
                 )
             _run_vipe(
                 input_video,
@@ -880,6 +889,7 @@ def run_chunked_roomtour(
                 artifact_name=spec.name,
                 mode="pose",
                 loop_closure=loop_closure,
+                loop_experiment=loop_experiment,
             )
         else:
             logger.info("Complete SLAM checkpoint already exists for %s", spec.name)
@@ -926,7 +936,11 @@ def run_chunked_roomtour(
     depth_jobs = [
         chunk
         for chunk in results
-        if not chunk.artifact.depth_matches(depth_options, loop_closure=loop_closure)
+        if not chunk.artifact.depth_matches(
+            depth_options,
+            loop_closure=loop_closure,
+            loop_experiment=loop_experiment,
+        )
     ]
     if depth_jobs and skip_inference:
         missing = ", ".join(chunk.spec.name for chunk in depth_jobs)
@@ -939,6 +953,7 @@ def run_chunked_roomtour(
         depth_options=depth_options,
         depth_workers=depth_workers,
         loop_closure=loop_closure,
+        loop_experiment=loop_experiment,
     )
 
     # Phase 3: build per-chunk RGB-D maps only after all requested depth is

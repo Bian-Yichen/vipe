@@ -309,12 +309,18 @@ def _save_slam_checkpoint(artifact: io.ArtifactPath, slam_output: SLAMOutput, n_
     loop_report = slam_output.loop_closure_report
     loop_enabled = loop_report is not None and bool(loop_report.get("enabled", False))
     loop_version = int(loop_report.get("version", 0)) if loop_enabled else 0
+    loop_experiment = (
+        str(loop_report.get("experiment_mode", "normal"))
+        if loop_enabled
+        else "normal"
+    )
     with artifact.meta_info_path.open("wb") as handle:
         pickle.dump(
             {
                 "ba_residual": slam_output.ba_residual,
                 "loop_closure_enabled": loop_enabled,
                 "loop_closure_version": loop_version,
+                "loop_closure_experiment": loop_experiment,
                 "loop_closure_report": loop_report,
             },
             handle,
@@ -336,6 +342,7 @@ def _load_slam_checkpoint(
     n_frames: int,
     *,
     expected_loop_closure: bool,
+    expected_loop_experiment: str,
 ) -> SLAMOutput | None:
     """Load a complete streaming checkpoint, or return ``None`` if incomplete."""
 
@@ -355,17 +362,25 @@ def _load_slam_checkpoint(
         loop_report = None
         saved_loop_closure = False
         saved_loop_version = 0
+        saved_loop_experiment = "normal"
         if artifact.meta_info_path.exists():
             with artifact.meta_info_path.open("rb") as handle:
                 meta_info = pickle.load(handle)
             ba_residual = float(meta_info.get("ba_residual", 0.0))
             saved_loop_closure = bool(meta_info.get("loop_closure_enabled", False))
             saved_loop_version = int(meta_info.get("loop_closure_version", 0))
+            saved_loop_experiment = str(
+                meta_info.get("loop_closure_experiment", "normal")
+            )
             loop_report = meta_info.get("loop_closure_report")
         expected_loop_version = LOOP_CLOSURE_CACHE_VERSION if expected_loop_closure else 0
         if (
             saved_loop_closure != bool(expected_loop_closure)
             or saved_loop_version != expected_loop_version
+            or (
+                expected_loop_closure
+                and saved_loop_experiment != expected_loop_experiment
+            )
         ):
             logger.info(
                 "Ignoring SLAM checkpoint for %s because loop-closure mode/version changed",
@@ -415,6 +430,11 @@ class StreamingRoomTourPipeline(DefaultAnnotationPipeline):
             "slam_loop_closure_version": (
                 LOOP_CLOSURE_CACHE_VERSION if self.slam_cfg.loop_closure.enabled else 0
             ),
+            "slam_loop_experiment": (
+                str(self.slam_cfg.loop_closure.experiment_mode)
+                if self.slam_cfg.loop_closure.enabled
+                else "normal"
+            ),
         }
 
     def _add_post_processors(
@@ -458,6 +478,9 @@ class StreamingRoomTourPipeline(DefaultAnnotationPipeline):
             artifact,
             n_frames,
             expected_loop_closure=bool(self.slam_cfg.loop_closure.enabled),
+            expected_loop_experiment=str(
+                self.slam_cfg.loop_closure.experiment_mode
+            ),
         )
         if slam_output is None:
             if require_checkpoint:
@@ -522,6 +545,7 @@ class StreamingRoomTourPipeline(DefaultAnnotationPipeline):
                 "overlap_size": 3,
                 "slam_loop_closure": False,
                 "slam_loop_closure_version": 0,
+                "slam_loop_experiment": "normal",
             }
             try:
                 saved_config = json.loads(metadata_path.read_text()) if metadata_path.exists() else legacy_quality
