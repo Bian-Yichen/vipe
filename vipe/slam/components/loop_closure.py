@@ -119,12 +119,23 @@ def _rotation_degrees(matrix: np.ndarray) -> float:
     return float(np.degrees(Rotation.from_matrix(matrix[:3, :3]).magnitude()))
 
 
-def _retrieval_descriptors(buffer: GraphBuffer, batch_size: int = 32) -> np.ndarray:
+def _retrieval_descriptors(
+    buffer: GraphBuffer,
+    n_frames: int | None = None,
+    batch_size: int = 32,
+) -> np.ndarray:
     """Pool the already-computed DROID correspondence features without a new model."""
 
+    n_frames = int(buffer.n_frames if n_frames is None else n_frames)
+    if n_frames <= 0:
+        return np.empty((0, 0), dtype=np.float32)
     descriptors = []
-    for start in range(0, buffer.n_frames, batch_size):
-        features = buffer.fmaps[start : start + batch_size, 0].float()
+    for start in range(0, n_frames, batch_size):
+        # GraphBuffer is preallocated.  The last batch must stop at the number
+        # of valid keyframes, otherwise a non-multiple-of-32 count also pools
+        # unused capacity slots (for example 124 valid frames became 128).
+        end = min(start + batch_size, n_frames)
+        features = buffer.fmaps[start:end, 0].float()
         features = F.normalize(features, dim=1)
         # A small spatial pyramid is substantially more discriminative than a
         # single global mean, while remaining almost free compared with SLAM.
@@ -134,11 +145,19 @@ def _retrieval_descriptors(buffer: GraphBuffer, batch_size: int = 32) -> np.ndar
         descriptors.append(
             F.normalize(torch.cat((global_mean, global_rms, spatial), dim=1), dim=1).cpu()
         )
-    return torch.cat(descriptors).numpy().astype(np.float32, copy=False)
+    pooled = torch.cat(descriptors)
+    if len(pooled) != n_frames:
+        raise RuntimeError(
+            f"Expected {n_frames} valid DROID descriptors, pooled {len(pooled)}"
+        )
+    return pooled.numpy().astype(np.float32, copy=False)
 
 
-def _w2c_and_centers(buffer: GraphBuffer) -> tuple[np.ndarray, np.ndarray]:
-    w2c = SE3(buffer.poses[: buffer.n_frames]).matrix().detach().cpu().numpy().astype(np.float64)
+def _w2c_and_centers(
+    buffer: GraphBuffer, n_frames: int | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    n_frames = int(buffer.n_frames if n_frames is None else n_frames)
+    w2c = SE3(buffer.poses[:n_frames]).matrix().detach().cpu().numpy().astype(np.float64)
     c2w = np.linalg.inv(w2c)
     return w2c, c2w[:, :3, 3]
 
@@ -274,19 +293,20 @@ def _advanced_candidate_pairs(
 ) -> tuple[list[tuple[int, int, float, float, int, float]], dict[str, Any]]:
     """Retrieve long sequence-level loop seeds, independent of current pose."""
 
-    droid = _retrieval_descriptors(buffer)
-    vlad = _sift_vlad_descriptors(cache, buffer.n_frames, options)
+    n_keyframes = int(buffer.n_frames)
+    droid = _retrieval_descriptors(buffer, n_keyframes)
+    vlad = _sift_vlad_descriptors(cache, n_keyframes, options)
     droid_similarity = droid @ droid.T
     vlad_similarity = vlad @ vlad.T
     similarities = (
         options.droid_retrieval_weight * droid_similarity
         + (1.0 - options.droid_retrieval_weight) * vlad_similarity
     )
-    timestamps = buffer.tstamp[: buffer.n_frames].detach().cpu().numpy().astype(np.int64)
-    _, centers = _w2c_and_centers(buffer)
+    timestamps = buffer.tstamp[:n_keyframes].detach().cpu().numpy().astype(np.int64)
+    _, centers = _w2c_and_centers(buffer, n_keyframes)
     candidates: list[tuple[int, int, float, float, int, float]] = []
 
-    for target in range(buffer.n_frames):
+    for target in range(n_keyframes):
         target_candidates = []
         for source in range(target):
             if target - source < options.min_keyframe_gap:
@@ -330,7 +350,7 @@ def _advanced_candidate_pairs(
     droid_weight = options.droid_retrieval_weight
     return selected, {
         "version": LOOP_CLOSURE_VERSION,
-        "keyframes": int(buffer.n_frames),
+        "keyframes": n_keyframes,
         "raw_long_sequence_candidates": len(candidates),
         "candidates_after_nms": len(selected),
         "retrieval_descriptor": (

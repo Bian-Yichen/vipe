@@ -1,14 +1,27 @@
 from __future__ import annotations
 
 import numpy as np
+import torch
 
 from vipe.slam.components.loop_closure import (
     LoopClosureOptions,
     LoopConstraint,
     _optimize_pose_graph_matrices,
+    _retrieval_descriptors,
     _sequence_score,
     _sequence_filter,
 )
+
+
+def test_retrieval_ignores_preallocated_buffer_capacity() -> None:
+    class FakeBuffer:
+        n_frames = 124
+        # Capacity is 128, but only the first 124 slots are valid keyframes.
+        fmaps = torch.randn(128, 1, 4, 2, 2)
+
+    descriptors = _retrieval_descriptors(FakeBuffer(), batch_size=32)
+
+    assert descriptors.shape[0] == FakeBuffer.n_frames
 
 
 def _constraint(source: int, target: int, transform: np.ndarray) -> LoopConstraint:
