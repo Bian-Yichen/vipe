@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 from urllib.parse import parse_qs, urlparse
 
 from .depth_options import DenseDepthOptions
@@ -50,6 +50,23 @@ _VIDEO_LOG_ENV = "VIPE_ROOMTOUR_LOG_FILE"
 _VIDEO_LOG_FORMAT = (
     "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
+_ACTIVE_CLAIM_HANDLES: set[TextIO] = set()
+
+
+def _close_claim_locks_after_fork() -> None:
+    # A raw fork duplicates file descriptors even when they are marked
+    # close-on-exec. Close the child's copies so an orphaned inference child
+    # cannot keep a dead batch worker's video lease alive.
+    for handle in tuple(_ACTIVE_CLAIM_HANDLES):
+        try:
+            handle.close()
+        except OSError:
+            pass
+    _ACTIVE_CLAIM_HANDLES.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_close_claim_locks_after_fork)
 
 
 def _utc_now() -> str:
@@ -240,8 +257,22 @@ def remote_join(root: str, name: str) -> str:
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-    os.replace(temporary, path)
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @dataclass
@@ -249,45 +280,19 @@ class WorkClaim:
     store: "StateStore"
     video_id: str
     token: str
-    lock_dir: Path
-    heartbeat_seconds: float
-    _stop: threading.Event | None = None
-    _thread: threading.Thread | None = None
+    lock_path: Path
+    handle: TextIO
+    _released: bool = False
 
     def __enter__(self) -> "WorkClaim":
-        self._stop = threading.Event()
-
-        def heartbeat() -> None:
-            heartbeat_path = self.lock_dir / "heartbeat"
-            while not self._stop.wait(self.heartbeat_seconds):
-                try:
-                    heartbeat_path.touch()
-                except FileNotFoundError:
-                    return
-                except OSError:
-                    logger.exception(
-                        "Could not refresh lock heartbeat for %s",
-                        self.video_id,
-                    )
-
-        self._thread = threading.Thread(
-            target=heartbeat,
-            name=f"heartbeat-{self.video_id}",
-            daemon=True,
-        )
-        self._thread.start()
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        if self._stop is not None:
-            self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=max(2.0, self.heartbeat_seconds))
         self.store.release(self)
 
 
 class StateStore:
-    """Shared JSONL audit log plus atomic per-video lease directories."""
+    """Shared audit/progress files plus crash-released per-video locks."""
 
     def __init__(
         self,
@@ -300,6 +305,9 @@ class StateStore:
         self.state_file = Path(state_file).resolve()
         self.worker_id = worker_id
         self.stale_lock_seconds = float(stale_lock_seconds)
+        # Retained as an accepted argument for callers upgrading from the
+        # heartbeat-directory implementation. New locks are kernel leases and
+        # do not need heartbeats.
         self.heartbeat_seconds = float(heartbeat_seconds)
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_root = self.state_file.parent / (
@@ -307,9 +315,11 @@ class StateStore:
         )
         self.lock_root = self.state_root / "locks"
         self.done_root = self.state_root / "done"
+        self.chunk_root = self.state_root / "chunks"
         self.failure_file = self.state_root / "failures.jsonl"
         self.lock_root.mkdir(parents=True, exist_ok=True)
         self.done_root.mkdir(parents=True, exist_ok=True)
+        self.chunk_root.mkdir(parents=True, exist_ok=True)
         self._completed: set[str] = set()
         self._state_signature: tuple[int, int] | None = None
         self._refresh_completed(force=True)
@@ -341,7 +351,7 @@ class StateStore:
         self._refresh_completed()
         return video_id in self._completed
 
-    def _lock_is_stale(self, lock_dir: Path) -> bool:
+    def _legacy_lock_is_stale(self, lock_dir: Path) -> bool:
         heartbeat = lock_dir / "heartbeat"
         try:
             modified = heartbeat.stat().st_mtime
@@ -352,28 +362,69 @@ class StateStore:
                 return False
         return time.time() - modified > self.stale_lock_seconds
 
+    def _legacy_owner_is_dead(self, lock_dir: Path) -> bool:
+        """Return true only when a same-host legacy owner is certainly dead."""
+
+        try:
+            owner = json.loads((lock_dir / "owner.json").read_text())
+            owner_host = str(owner["hostname"])
+            owner_pid = int(owner["pid"])
+        except (FileNotFoundError, OSError, ValueError, TypeError, KeyError):
+            return False
+        if owner_host != socket.gethostname():
+            return False
+        try:
+            os.kill(owner_pid, 0)
+        except ProcessLookupError:
+            return True
+        except (PermissionError, OSError):
+            return False
+        return False
+
+    def _remove_reclaimable_legacy_lock(self, lock_path: Path) -> bool:
+        """Migrate a directory lease left by the previous worker version."""
+
+        if not lock_path.is_dir():
+            return True
+        if not (
+            self._legacy_owner_is_dead(lock_path)
+            or self._legacy_lock_is_stale(lock_path)
+        ):
+            return False
+        stale = self.lock_root / (
+            f"{lock_path.stem}.legacy-stale.{uuid.uuid4().hex}"
+        )
+        try:
+            os.rename(lock_path, stale)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        shutil.rmtree(stale, ignore_errors=True)
+        logger.info("Reclaimed legacy directory lock: %s", lock_path.name)
+        return True
+
     def try_claim(self, video_id: str, url: str) -> WorkClaim | None:
         if self.is_done(video_id):
             return None
-        lock_dir = self.lock_root / f"{video_id}.lock"
+        lock_path = self.lock_root / f"{video_id}.lock"
         token = uuid.uuid4().hex
-        while True:
-            try:
-                lock_dir.mkdir()
-                break
-            except FileExistsError:
-                if not self._lock_is_stale(lock_dir):
-                    return None
-                stale = self.lock_root / (
-                    f"{video_id}.stale.{uuid.uuid4().hex}"
-                )
-                try:
-                    os.rename(lock_dir, stale)
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    return None
-                shutil.rmtree(stale, ignore_errors=True)
+        if not self._remove_reclaimable_legacy_lock(lock_path):
+            return None
+
+        handle = lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            return None
+        except OSError as exc:
+            handle.close()
+            raise RuntimeError(
+                f"Shared state filesystem does not support reliable flock "
+                f"leases: {lock_path}"
+            ) from exc
+        _ACTIVE_CLAIM_HANDLES.add(handle)
 
         owner = {
             "video_id": video_id,
@@ -383,38 +434,123 @@ class StateStore:
             "hostname": socket.gethostname(),
             "token": token,
             "claimed_at": _utc_now(),
+            "lock_type": "posix_flock",
         }
         try:
-            _atomic_write_json(lock_dir / "owner.json", owner)
-            (lock_dir / "heartbeat").touch()
+            handle.seek(0)
+            handle.truncate()
+            handle.write(json.dumps(owner, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         except Exception:
-            shutil.rmtree(lock_dir, ignore_errors=True)
+            _ACTIVE_CLAIM_HANDLES.discard(handle)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
             raise
         claim = WorkClaim(
             store=self,
             video_id=video_id,
             token=token,
-            lock_dir=lock_dir,
-            heartbeat_seconds=self.heartbeat_seconds,
+            lock_path=lock_path,
+            handle=handle,
         )
-        # Close the race with a worker that completed immediately before mkdir.
+        # Close the race with a worker that completed immediately before flock.
         if self.is_done(video_id):
             self.release(claim)
             return None
         return claim
 
     def release(self, claim: WorkClaim) -> None:
+        if claim._released:
+            return
+        claim._released = True
+        _ACTIVE_CLAIM_HANDLES.discard(claim.handle)
         try:
-            owner = json.loads((claim.lock_dir / "owner.json").read_text())
-        except (FileNotFoundError, OSError, ValueError):
-            return
-        if owner.get("token") != claim.token:
-            logger.error(
-                "Refusing to release a lock no longer owned by this worker: %s",
-                claim.lock_dir,
+            fcntl.flock(claim.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            claim.handle.close()
+
+    def _chunk_progress_path(self, video_id: str) -> Path:
+        return self.chunk_root / f"{video_id}.json"
+
+    def successful_chunks(
+        self,
+        *,
+        video_id: str,
+        plan: dict[str, Any],
+    ) -> set[str]:
+        """Load durable uploaded-chunk checkpoints for an identical plan."""
+
+        path = self._chunk_progress_path(video_id)
+        if not path.exists():
+            return set()
+        try:
+            progress = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"Cannot read chunk progress for {video_id}: {path}"
+            ) from exc
+        if progress.get("plan") != plan:
+            raise RuntimeError(
+                f"Existing chunk progress for {video_id} was created with a "
+                "different source/output/chunk/inference configuration. Use "
+                "the original command or a new --state-file."
             )
-            return
-        shutil.rmtree(claim.lock_dir, ignore_errors=True)
+        chunks = progress.get("successful_chunks", {})
+        if not isinstance(chunks, dict):
+            raise RuntimeError(f"Malformed chunk progress file: {path}")
+        return {
+            str(name)
+            for name, record in chunks.items()
+            if isinstance(record, dict) and record.get("status") == "success"
+        }
+
+    def mark_chunk_success(
+        self,
+        *,
+        video_id: str,
+        url: str,
+        plan: dict[str, Any],
+        spec: ChunkSpec,
+        remote_destination: str,
+    ) -> dict[str, Any]:
+        """Atomically checkpoint one chunk only after its upload succeeds."""
+
+        path = self._chunk_progress_path(video_id)
+        if path.exists():
+            try:
+                progress = json.loads(path.read_text())
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Cannot update chunk progress for {video_id}: {path}"
+                ) from exc
+            if progress.get("plan") != plan:
+                raise RuntimeError(
+                    f"Chunk plan changed while processing {video_id}"
+                )
+        else:
+            progress = {
+                "schema_version": 1,
+                "video_id": video_id,
+                "url": url,
+                "plan": plan,
+                "successful_chunks": {},
+                "created_at": _utc_now(),
+            }
+        chunk_name = spec.folder_name(video_id)
+        record = {
+            "status": "success",
+            "start_frame": spec.start_frame,
+            "end_frame_exclusive": spec.end_frame,
+            "frame_count": spec.frame_count,
+            "remote_destination": remote_destination,
+            "uploaded_at": _utc_now(),
+            "worker_id": self.worker_id,
+        }
+        progress["successful_chunks"][chunk_name] = record
+        progress["updated_at"] = _utc_now()
+        _atomic_write_json(path, progress)
+        return record
 
     @staticmethod
     def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
@@ -824,7 +960,112 @@ def _run_chunk_slam(
     )
 
 
-def _prepare_and_process_chunks(
+def _chunk_plan(
+    *,
+    video_id: str,
+    source_remote: str,
+    remote_output: str,
+    video_info: dict[str, Any],
+    specs: list[ChunkSpec],
+    pipeline: str,
+    depth_options: DenseDepthOptions,
+    map_options: MapOptions,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "video_id": video_id,
+        "source_remote": source_remote.rstrip("/"),
+        "remote_output": remote_output.rstrip("/"),
+        "video": video_info,
+        "chunks": [
+            {
+                "name": spec.folder_name(video_id),
+                "start_frame": spec.start_frame,
+                "end_frame_exclusive": spec.end_frame,
+            }
+            for spec in specs
+        ],
+        "inference": _slam_config(pipeline, depth_options, map_options),
+    }
+
+
+def _cleanup_local_chunk(chunk_dir: Path) -> None:
+    if chunk_dir.is_dir() and not chunk_dir.is_symlink():
+        shutil.rmtree(chunk_dir)
+    else:
+        chunk_dir.unlink(missing_ok=True)
+    try:
+        chunk_dir.parent.rmdir()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def _reconcile_local_chunks(
+    processing_root: Path,
+    video_id: str,
+    specs: list[ChunkSpec],
+    successful_chunks: set[str],
+) -> None:
+    """Clean uploaded/obsolete leftovers and retain at most one resumable chunk."""
+
+    result_root = processing_root / "result"
+    if not result_root.is_dir():
+        return
+    expected_order = {
+        spec.folder_name(video_id): index
+        for index, spec in enumerate(specs)
+    }
+    chunk_pattern = re.compile(
+        rf"{re.escape(video_id)}_\d{{6,}}_\d{{6,}}\.mp4"
+    )
+    all_video_chunks = [
+        path
+        for path in result_root.iterdir()
+        if chunk_pattern.fullmatch(path.name)
+    ]
+    for obsolete in all_video_chunks:
+        if obsolete.name in expected_order:
+            continue
+        logger.warning(
+            "Removing local chunk outside the current plan: %s",
+            obsolete.name,
+        )
+        _cleanup_local_chunk(obsolete)
+    candidates = [
+        path
+        for path in all_video_chunks
+        if path.name in expected_order
+    ]
+    for chunk_dir in candidates:
+        if chunk_dir.name in successful_chunks:
+            logger.info(
+                "Removing local chunk already checkpointed as uploaded: %s",
+                chunk_dir.name,
+            )
+            _cleanup_local_chunk(chunk_dir)
+
+    remaining = sorted(
+        (
+            path
+            for path in candidates
+            if path.exists() and path.name not in successful_chunks
+        ),
+        key=lambda path: expected_order[path.name],
+    )
+    if not remaining:
+        return
+    keep = remaining[0]
+    for obsolete in remaining[1:]:
+        logger.warning(
+            "Removing extra pre-upgrade chunk to enforce one-chunk disk "
+            "bound: %s (retaining %s)",
+            obsolete.name,
+            keep.name,
+        )
+        _cleanup_local_chunk(obsolete)
+
+
+def _prepare_process_upload_chunks(
     source_video: Path,
     processing_root: Path,
     video_id: str,
@@ -836,14 +1077,40 @@ def _prepare_and_process_chunks(
     depth_options: DenseDepthOptions,
     map_options: MapOptions,
     offline_models: bool,
-) -> list[Path]:
-    """Pipeline one splitter thread into one sequential SLAM consumer."""
+    rclone: RcloneClient,
+    remote_output: str,
+    url: str,
+    state: StateStore,
+    plan: dict[str, Any],
+    successful_chunks: set[str],
+) -> list[str]:
+    """Prepare, solve, upload, checkpoint, and delete one chunk at a time."""
 
     result_root = processing_root / "result"
     result_root.mkdir(parents=True, exist_ok=True)
+    _reconcile_local_chunks(
+        processing_root,
+        video_id,
+        specs,
+        successful_chunks,
+    )
+    pending_specs = [
+        spec
+        for spec in specs
+        if spec.folder_name(video_id) not in successful_chunks
+    ]
+    if not pending_specs:
+        logger.info(
+            "All %d chunks already have durable upload checkpoints for %s",
+            len(specs),
+            video_id,
+        )
+        return [spec.folder_name(video_id) for spec in specs]
+
     prepared: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
     stop = threading.Event()
-    completed: list[Path] = []
+    consumed = threading.Event()
+    consumed.set()
 
     def put_message(kind: str, payload: Any) -> bool:
         while not stop.is_set():
@@ -856,9 +1123,14 @@ def _prepare_and_process_chunks(
 
     def produce_chunks() -> None:
         try:
-            for spec in specs:
+            for spec in pending_specs:
+                while not stop.is_set() and not consumed.wait(timeout=0.2):
+                    pass
                 if stop.is_set():
                     return
+                # The producer may create the next chunk only after the main
+                # thread uploaded, checkpointed, and deleted the previous one.
+                consumed.clear()
                 chunk_dir = _prepare_chunk(
                     source_video,
                     result_root,
@@ -888,22 +1160,60 @@ def _prepare_and_process_chunks(
             if kind == "error":
                 raise payload
             chunk_dir = payload
-            # At most one following chunk is prepared while this GPU-heavy
-            # stage runs, keeping local disk growth bounded.
-            _run_chunk_slam(
-                chunk_dir,
-                pipeline=pipeline,
-                depth_options=depth_options,
-                map_options=map_options,
-                offline_models=offline_models,
-            )
-            completed.append(chunk_dir)
+            try:
+                _run_chunk_slam(
+                    chunk_dir,
+                    pipeline=pipeline,
+                    depth_options=depth_options,
+                    map_options=map_options,
+                    offline_models=offline_models,
+                )
+                remote_destination = remote_join(
+                    remote_output,
+                    chunk_dir.name,
+                )
+                rclone.copy_directory(chunk_dir, remote_destination)
+                matching_spec = next(
+                    spec
+                    for spec in pending_specs
+                    if spec.folder_name(video_id) == chunk_dir.name
+                )
+                state.mark_chunk_success(
+                    video_id=video_id,
+                    url=url,
+                    plan=plan,
+                    spec=matching_spec,
+                    remote_destination=remote_destination,
+                )
+                successful_chunks.add(chunk_dir.name)
+                _cleanup_local_chunk(chunk_dir)
+                logger.info(
+                    "Uploaded, checkpointed, and deleted local chunk %s "
+                    "(%d/%d)",
+                    chunk_dir.name,
+                    len(successful_chunks),
+                    len(specs),
+                )
+            except BaseException:
+                # Wake the producer so it can observe stop, but never allow it
+                # to begin another chunk after a failed commit sequence.
+                stop.set()
+                consumed.set()
+                raise
+            else:
+                consumed.set()
     finally:
         stop.set()
+        consumed.set()
         producer.join()
 
-    completed.sort()
-    return completed
+    planned_names = [spec.folder_name(video_id) for spec in specs]
+    if successful_chunks != set(planned_names):
+        missing = sorted(set(planned_names) - successful_chunks)
+        raise RuntimeError(
+            f"Missing uploaded-chunk checkpoints for {video_id}: {missing}"
+        )
+    return planned_names
 
 
 def _download_video(
@@ -934,21 +1244,16 @@ def _download_video(
     return destination
 
 
-def _upload_video_results(
+def _upload_video_manifest(
     rclone: RcloneClient,
     *,
-    chunk_dirs: list[Path],
+    chunk_names: list[str],
     remote_output: str,
     processing_root: Path,
     video_id: str,
     url: str,
     video_info: dict[str, Any],
 ) -> Path:
-    for chunk_dir in chunk_dirs:
-        rclone.copy_directory(
-            chunk_dir,
-            remote_join(remote_output, chunk_dir.name),
-        )
     manifest = processing_root / "temp" / f"{video_id}_manifest.json"
     _atomic_write_json(
         manifest,
@@ -957,7 +1262,7 @@ def _upload_video_results(
             "url": url,
             "uploaded_at": _utc_now(),
             "video": video_info,
-            "chunks": [chunk_dir.name for chunk_dir in chunk_dirs],
+            "chunks": chunk_names,
         },
     )
     rclone.copy_file(
@@ -1029,7 +1334,7 @@ def run_batch_worker(
     map_options: MapOptions,
     ffmpeg_threads: int = 2,
     max_videos: int = 0,
-    stale_lock_hours: float = 6.0,
+    stale_lock_hours: float = 0.1,
     worker_id: str | None = None,
     rclone_binary: str = "rclone",
     rclone_transfers: int = 16,
@@ -1170,7 +1475,28 @@ def run_batch_worker(
                     video_info["total_frames"],
                     len(specs),
                 )
-                chunk_dirs = _prepare_and_process_chunks(
+                plan = _chunk_plan(
+                    video_id=video_id,
+                    source_remote=source_remote,
+                    remote_output=remote_output,
+                    video_info=video_info,
+                    specs=specs,
+                    pipeline=pipeline,
+                    depth_options=depth_options,
+                    map_options=map_options,
+                )
+                successful_chunks = state.successful_chunks(
+                    video_id=video_id,
+                    plan=plan,
+                )
+                if successful_chunks:
+                    logger.info(
+                        "Resuming %s with %d/%d chunks already uploaded",
+                        video_id,
+                        len(successful_chunks),
+                        len(specs),
+                    )
+                chunk_names = _prepare_process_upload_chunks(
                     source_video,
                     processing_root,
                     video_id,
@@ -1181,17 +1507,22 @@ def run_batch_worker(
                     depth_options=depth_options,
                     map_options=map_options,
                     offline_models=offline_models,
+                    rclone=rclone,
+                    remote_output=remote_output,
+                    url=url,
+                    state=state,
+                    plan=plan,
+                    successful_chunks=successful_chunks,
                 )
-                _upload_video_results(
+                _upload_video_manifest(
                     rclone,
-                    chunk_dirs=chunk_dirs,
+                    chunk_names=chunk_names,
                     remote_output=remote_output,
                     processing_root=processing_root,
                     video_id=video_id,
                     url=url,
                     video_info=video_info,
                 )
-                chunk_names = [path.name for path in chunk_dirs]
                 _cleanup_local_video(processing_root, video_id)
                 state.mark_terminal(
                     video_id=video_id,
@@ -1201,7 +1532,7 @@ def run_batch_worker(
                         "source_remote": source_remote,
                         "remote_output": remote_output,
                         "total_frames": video_info["total_frames"],
-                        "chunk_count": len(chunk_dirs),
+                        "chunk_count": len(chunk_names),
                         "chunks": chunk_names,
                     },
                 )
