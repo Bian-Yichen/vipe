@@ -2,8 +2,9 @@
 
 `batch-run` scans a shared YouTube URL text file, atomically claims one video
 at a time, downloads `VIDEO_ID.mp4` through rclone, creates independent chunks,
-runs the existing single-video VIPE pipeline for every chunk, uploads all
-results, and marks the source video complete.
+runs the existing single-video VIPE pipeline for every chunk, immediately
+uploads/checkpoints/deletes that chunk, and marks the source video complete
+after every planned chunk is durable remotely.
 
 The implementation is based on `agent/roomtour-chunked-sim3`, but it does not
 stitch adjacent chunks. Every chunk is a completely independent SLAM solve.
@@ -98,26 +99,50 @@ A video-level completion manifest is uploaded last to
 
 ## Concurrency and recovery
 
-For every video, the worker atomically creates a lease directory next to the
-shared state file. Other workers that cannot acquire that lease skip the video
-and continue scanning. A heartbeat keeps long VIPE jobs alive; abandoned leases
-can be reclaimed after `--stale-lock-hours`.
+For every video, the worker holds a non-blocking POSIX `flock` next to the
+shared state file. Other workers that cannot acquire that lock skip the video
+and continue scanning. The kernel releases the lease immediately when the
+worker exits, is killed, or is preempted; the small lock file remains as owner
+metadata but does not remain locked. The shared filesystem containing
+`--state-file` must support `flock`.
 
-Inside one worker, exactly one splitter thread prepares `video.mp4` and `RGB/`
-for upcoming chunks. The main worker consumes those chunks and runs one SLAM
-job at a time. The queue holds at most one prepared chunk, so ffmpeg work can
-overlap SLAM without starting concurrent SLAM jobs or allowing local disk usage
-to grow without a bound.
+`--stale-lock-hours` is now used only to migrate directory/heartbeat locks left
+by an older worker version. Its default is 0.1 hours (six minutes). A legacy
+lock owned by a dead PID on the current host is reclaimed immediately.
 
-The completion sequence is:
+Inside one worker, the splitter thread prepares `video.mp4` and `RGB/`, and the
+main thread runs SLAM and upload. A completion gate prevents the splitter from
+preparing the next chunk until the current chunk has been uploaded,
+checkpointed, and deleted. Therefore each `VIDEO_ID` creates at most one local
+chunk directory at a time (in addition to its downloaded source MP4).
 
-1. upload every complete chunk;
-2. upload the video manifest;
-3. while still holding the lease, delete every local source, manifest, partial
-   download, and chunk directory belonging to this `VIDEO_ID`;
-4. append a durable `success` record to the shared JSONL and create a done
-   marker;
-5. release the lease.
+The per-chunk commit sequence is:
+
+1. prepare one chunk and run its independent VIPE/SLAM/depth/map pipeline;
+2. upload that chunk to its final remote directory;
+3. atomically record the successful chunk in
+   `.STATE_FILE.state/chunks/VIDEO_ID.json`;
+4. delete that local chunk directory;
+5. only then allow the splitter to prepare the next chunk.
+
+After all chunk checkpoints exist, the worker uploads the video manifest,
+deletes the local source/temporary data, appends the terminal `success` record,
+and releases the lease.
+
+This order defines the recovery behavior:
+
+- killed during SLAM: the one partial local chunk is resumed/rebuilt;
+- killed during upload: no checkpoint exists, so the same remote path is
+  uploaded again idempotently;
+- killed after checkpoint but before deletion: the next owner deletes the
+  leftover and skips that chunk;
+- killed after several chunks: the next owner reads the per-video checkpoint
+  and starts at the first chunk not recorded as successful.
+
+The checkpoint also stores the source, destination, chunk plan, and inference
+configuration. A retry with incompatible arguments fails clearly instead of
+silently combining different outputs; use the original command or a new
+`--state-file`.
 
 Cleanup never deletes another video's paths, so workers sharing
 `PROCESSING_ROOT` remain isolated. The common `temp/` and `result/` directories
@@ -127,7 +152,9 @@ are cleaned, recorded as `missing_remote`, and will not be scanned again.
 
 Failed processing or upload attempts are written to
 `.STATE_FILE.state/failures.jsonl`, are not marked complete, and remain
-retryable in a later invocation. Partial local chunk outputs are retained for
+retryable in a later invocation. The current partial chunk is retained for
 resume. Use `--fail-fast` when one failure should terminate the worker.
 
-Successfully uploaded local data is always deleted to release disk space.
+The launch command is unchanged. Workers must share the same `--state-file`;
+using the same `PROCESSING_ROOT` also lets a replacement worker reuse or clean
+the interrupted worker's local partial chunk.
