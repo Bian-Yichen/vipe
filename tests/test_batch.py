@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
+import socket
+import subprocess
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,12 +17,14 @@ from vipe_roomtour.batch import (
     RcloneClient,
     StateStore,
     _cleanup_local_video,
-    _prepare_and_process_chunks,
+    _prepare_process_upload_chunks,
     _video_log_context,
     plan_independent_chunks,
     remote_join,
     youtube_video_id,
 )
+from vipe_roomtour.depth_options import DenseDepthOptions
+from vipe_roomtour.map_builder import MapOptions
 
 
 def _ranges(total: int, chunk: int = 5000, overlap: int = 1000):
@@ -100,39 +104,111 @@ def test_shared_claim_and_terminal_record(tmp_path: Path) -> None:
     assert records[-1]["status"] == "success"
 
 
-def test_stale_lock_can_be_reclaimed_without_old_owner_release(
+def test_flock_is_released_immediately_after_process_is_killed(
     tmp_path: Path,
 ) -> None:
     state_file = tmp_path / "processed.jsonl"
-    first = StateStore(
-        state_file,
-        worker_id="worker-a",
-        stale_lock_seconds=0.01,
+    ready = tmp_path / "ready"
+    script = "\n".join(
+        [
+            "import os",
+            "import time",
+            "from pathlib import Path",
+            "from vipe_roomtour.batch import StateStore",
+            f"state = StateStore(Path({str(state_file)!r}), "
+            "worker_id='child', stale_lock_seconds=3600)",
+            "claim = state.try_claim('video123', 'https://youtu.be/video123')",
+            "assert claim is not None",
+            "grandchild = os.fork()",
+            "if grandchild == 0:",
+            "    time.sleep(60)",
+            "    os._exit(0)",
+            f"Path({str(ready)!r}).write_text(str(grandchild))",
+            "time.sleep(60)",
+        ]
     )
-    second = StateStore(
+    process = subprocess.Popen([sys.executable, "-c", script])
+    grandchild_pid = None
+    try:
+        deadline = time.time() + 10
+        while not ready.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        assert ready.exists()
+        grandchild_pid = int(ready.read_text())
+        contender = StateStore(
+            state_file,
+            worker_id="worker-b",
+            stale_lock_seconds=3600,
+        )
+        assert contender.try_claim(
+            "video123",
+            "https://youtu.be/video123",
+        ) is None
+        process.kill()
+        process.wait(timeout=10)
+        replacement = contender.try_claim(
+            "video123",
+            "https://youtu.be/video123",
+        )
+        assert replacement is not None
+        contender.release(replacement)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        if grandchild_pid is not None:
+            try:
+                os.kill(grandchild_pid, 9)
+            except ProcessLookupError:
+                pass
+
+
+def test_same_host_dead_legacy_directory_lock_is_reclaimed(
+    tmp_path: Path,
+) -> None:
+    state_file = tmp_path / "processed.jsonl"
+    store = StateStore(
         state_file,
         worker_id="worker-b",
-        stale_lock_seconds=0.01,
+        stale_lock_seconds=3600,
     )
-    old_claim = first.try_claim("video123", "https://youtu.be/video123")
-    assert old_claim is not None
-    old_time = time.time() - 10
-    os.utime(old_claim.lock_dir / "heartbeat", (old_time, old_time))
+    legacy = store.lock_root / "video123.lock"
+    legacy.mkdir()
+    (legacy / "owner.json").write_text(
+        json.dumps(
+            {
+                "hostname": socket.gethostname(),
+                "pid": 999_999_999,
+            }
+        )
+    )
+    (legacy / "heartbeat").touch()
 
-    new_claim = second.try_claim("video123", "https://youtu.be/video123")
-    assert new_claim is not None
-    # The original owner must not delete the replacement lock.
-    first.release(old_claim)
-    assert new_claim.lock_dir.exists()
-    second.release(new_claim)
+    claim = store.try_claim("video123", "https://youtu.be/video123")
+    assert claim is not None
+    assert claim.lock_path.is_file()
+    store.release(claim)
 
 
-def test_split_thread_and_slam_consumer_are_separate(
+def test_split_slam_upload_checkpoint_cleanup_are_chunk_serial(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    prepare_threads = []
-    slam_threads = []
+    events = []
+    existing_chunk_counts = []
+    processing_root = tmp_path / "processing"
+    source_video = processing_root / "temp" / "video123.mp4"
+    source_video.parent.mkdir(parents=True)
+    source_video.write_text("video")
+    specs = [
+        batch_module.ChunkSpec(0, 5000),
+        batch_module.ChunkSpec(4000, 9000),
+    ]
+    state = StateStore(
+        tmp_path / "state.jsonl",
+        worker_id="worker-a",
+        stale_lock_seconds=3600,
+    )
 
     def fake_prepare(
         source_video,
@@ -143,43 +219,314 @@ def test_split_thread_and_slam_consumer_are_separate(
         *,
         ffmpeg_threads,
     ):
-        prepare_threads.append(threading.current_thread().name)
+        existing_chunk_counts.append(
+            len(list(result_root.glob(f"{video_id}_*.mp4")))
+        )
+        events.append(("prepare", spec.start_frame))
         chunk_dir = result_root / spec.folder_name(video_id)
         chunk_dir.mkdir(parents=True)
         return chunk_dir
 
     def fake_slam(chunk_dir, **kwargs):
-        slam_threads.append(threading.current_thread().name)
+        events.append(("slam", chunk_dir.name))
+
+    class FakeRclone:
+        def copy_directory(self, source, destination):
+            assert source.exists()
+            events.append(("upload", source.name))
 
     monkeypatch.setattr(batch_module, "_prepare_chunk", fake_prepare)
     monkeypatch.setattr(batch_module, "_run_chunk_slam", fake_slam)
+
+    successful = set()
+    names = _prepare_process_upload_chunks(
+        source_video,
+        processing_root,
+        "video123",
+        specs,
+        {
+            "total_frames": 9000,
+            "fps": 30.0,
+            "width": 1280,
+            "height": 720,
+        },
+        ffmpeg_threads=2,
+        pipeline="roomtour_dav3",
+        depth_options=DenseDepthOptions.from_preset("preview"),
+        map_options=MapOptions(),
+        offline_models=True,
+        rclone=FakeRclone(),
+        remote_output="h:output",
+        url="https://youtu.be/video123",
+        state=state,
+        plan={"test": "plan"},
+        successful_chunks=successful,
+    )
+
+    assert names == [
+        "video123_000000_005000.mp4",
+        "video123_004000_009000.mp4",
+    ]
+    assert existing_chunk_counts == [0, 0]
+    assert not list((processing_root / "result").glob("video123_*.mp4"))
+    assert successful == set(names)
+    progress = json.loads(
+        (state.chunk_root / "video123.json").read_text()
+    )
+    assert set(progress["successful_chunks"]) == set(names)
+    assert [kind for kind, _ in events] == [
+        "prepare",
+        "slam",
+        "upload",
+        "prepare",
+        "slam",
+        "upload",
+    ]
+
+
+def test_resume_skips_checkpointed_chunk_and_cleans_its_leftover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processing_root = tmp_path / "processing"
+    source_video = processing_root / "temp" / "video123.mp4"
+    source_video.parent.mkdir(parents=True)
+    source_video.write_text("video")
     specs = [
         batch_module.ChunkSpec(0, 5000),
         batch_module.ChunkSpec(4000, 9000),
     ]
-    result = _prepare_and_process_chunks(
-        tmp_path / "source.mp4",
-        tmp_path,
+    second = StateStore(
+        tmp_path / "state.jsonl",
+        worker_id="worker-b",
+        stale_lock_seconds=3600,
+    )
+    plan = {"test": "plan"}
+    second.mark_chunk_success(
+        video_id="video123",
+        url="https://youtu.be/video123",
+        plan=plan,
+        spec=specs[0],
+        remote_destination="h:output/first",
+    )
+    first_leftover = (
+        processing_root / "result" / specs[0].folder_name("video123")
+    )
+    first_leftover.mkdir(parents=True)
+    prepared_specs = []
+
+    def fake_prepare(
+        source_video,
+        result_root,
+        video_id,
+        spec,
+        video_info,
+        *,
+        ffmpeg_threads,
+    ):
+        prepared_specs.append(spec)
+        chunk_dir = result_root / spec.folder_name(video_id)
+        chunk_dir.mkdir(parents=True)
+        return chunk_dir
+
+    class FakeRclone:
+        def copy_directory(self, source, destination):
+            pass
+
+    monkeypatch.setattr(batch_module, "_prepare_chunk", fake_prepare)
+    monkeypatch.setattr(batch_module, "_run_chunk_slam", lambda *a, **k: None)
+    successful = second.successful_chunks(
+        video_id="video123",
+        plan=plan,
+    )
+    _prepare_process_upload_chunks(
+        source_video,
+        processing_root,
         "video123",
         specs,
         {"total_frames": 9000},
         ffmpeg_threads=2,
         pipeline="roomtour_dav3",
-        depth_options=object(),
-        map_options=object(),
+        depth_options=DenseDepthOptions.from_preset("preview"),
+        map_options=MapOptions(),
         offline_models=True,
+        rclone=FakeRclone(),
+        remote_output="h:output",
+        url="https://youtu.be/video123",
+        state=second,
+        plan=plan,
+        successful_chunks=successful,
     )
 
-    assert [path.name for path in result] == [
-        "video123_000000_005000.mp4",
-        "video123_004000_009000.mp4",
+    assert prepared_specs == [specs[1]]
+    assert not first_leftover.exists()
+
+
+def test_failed_upload_keeps_chunk_and_does_not_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processing_root = tmp_path / "processing"
+    source_video = processing_root / "temp" / "video123.mp4"
+    source_video.parent.mkdir(parents=True)
+    source_video.write_text("video")
+    specs = [
+        batch_module.ChunkSpec(0, 5000),
+        batch_module.ChunkSpec(4000, 9000),
     ]
-    assert prepare_threads
-    assert all(name == "split-video123" for name in prepare_threads)
-    assert slam_threads == [
-        threading.current_thread().name,
-        threading.current_thread().name,
-    ]
+    prepared_specs = []
+    state = StateStore(
+        tmp_path / "state.jsonl",
+        worker_id="worker-a",
+        stale_lock_seconds=3600,
+    )
+
+    def fake_prepare(
+        source_video,
+        result_root,
+        video_id,
+        spec,
+        video_info,
+        *,
+        ffmpeg_threads,
+    ):
+        prepared_specs.append(spec)
+        chunk_dir = result_root / spec.folder_name(video_id)
+        chunk_dir.mkdir(parents=True)
+        return chunk_dir
+
+    class FailingRclone:
+        def copy_directory(self, source, destination):
+            raise subprocess.CalledProcessError(1, ["rclone", "copy"])
+
+    monkeypatch.setattr(batch_module, "_prepare_chunk", fake_prepare)
+    monkeypatch.setattr(batch_module, "_run_chunk_slam", lambda *a, **k: None)
+    with pytest.raises(subprocess.CalledProcessError):
+        _prepare_process_upload_chunks(
+            source_video,
+            processing_root,
+            "video123",
+            specs,
+            {"total_frames": 9000},
+            ffmpeg_threads=2,
+            pipeline="roomtour_dav3",
+            depth_options=DenseDepthOptions.from_preset("preview"),
+            map_options=MapOptions(),
+            offline_models=True,
+            rclone=FailingRclone(),
+            remote_output="h:output",
+            url="https://youtu.be/video123",
+            state=state,
+            plan={"test": "plan"},
+            successful_chunks=set(),
+        )
+
+    chunk_dir = (
+        processing_root / "result" / specs[0].folder_name("video123")
+    )
+    assert chunk_dir.exists()
+    assert prepared_specs == [specs[0]]
+    assert not (state.chunk_root / "video123.json").exists()
+
+
+def test_checkpoint_before_cleanup_is_recovered_without_reupload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processing_root = tmp_path / "processing"
+    source_video = processing_root / "temp" / "video123.mp4"
+    source_video.parent.mkdir(parents=True)
+    source_video.write_text("video")
+    spec = batch_module.ChunkSpec(0, 5000)
+    state = StateStore(
+        tmp_path / "state.jsonl",
+        worker_id="worker-a",
+        stale_lock_seconds=3600,
+    )
+    plan = {"test": "plan"}
+
+    def fake_prepare(
+        source_video,
+        result_root,
+        video_id,
+        spec,
+        video_info,
+        *,
+        ffmpeg_threads,
+    ):
+        chunk_dir = result_root / spec.folder_name(video_id)
+        chunk_dir.mkdir(parents=True)
+        return chunk_dir
+
+    upload_count = 0
+
+    class FakeRclone:
+        def copy_directory(self, source, destination):
+            nonlocal upload_count
+            upload_count += 1
+
+    original_cleanup = batch_module._cleanup_local_chunk
+    cleanup_attempts = 0
+
+    def interrupted_cleanup(path):
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        if cleanup_attempts == 1:
+            raise RuntimeError("simulated kill boundary")
+        original_cleanup(path)
+
+    monkeypatch.setattr(batch_module, "_prepare_chunk", fake_prepare)
+    monkeypatch.setattr(batch_module, "_run_chunk_slam", lambda *a, **k: None)
+    monkeypatch.setattr(
+        batch_module,
+        "_cleanup_local_chunk",
+        interrupted_cleanup,
+    )
+    with pytest.raises(RuntimeError, match="simulated kill"):
+        _prepare_process_upload_chunks(
+            source_video,
+            processing_root,
+            "video123",
+            [spec],
+            {"total_frames": 5000},
+            ffmpeg_threads=2,
+            pipeline="roomtour_dav3",
+            depth_options=DenseDepthOptions.from_preset("preview"),
+            map_options=MapOptions(),
+            offline_models=True,
+            rclone=FakeRclone(),
+            remote_output="h:output",
+            url="https://youtu.be/video123",
+            state=state,
+            plan=plan,
+            successful_chunks=set(),
+        )
+
+    successful = state.successful_chunks(video_id="video123", plan=plan)
+    assert successful == {spec.folder_name("video123")}
+    _prepare_process_upload_chunks(
+        source_video,
+        processing_root,
+        "video123",
+        [spec],
+        {"total_frames": 5000},
+        ffmpeg_threads=2,
+        pipeline="roomtour_dav3",
+        depth_options=DenseDepthOptions.from_preset("preview"),
+        map_options=MapOptions(),
+        offline_models=True,
+        rclone=FakeRclone(),
+        remote_output="h:output",
+        url="https://youtu.be/video123",
+        state=state,
+        plan=plan,
+        successful_chunks=successful,
+    )
+
+    assert upload_count == 1
+    assert not (
+        processing_root / "result" / spec.folder_name("video123")
+    ).exists()
 
 
 def test_cleanup_removes_only_requested_video(tmp_path: Path) -> None:
@@ -220,12 +567,6 @@ def test_success_uploads_then_cleans_then_marks_done(
     processing_root = tmp_path / "processing"
     state_file = tmp_path / "state.jsonl"
     source_video = processing_root / "temp" / "video123.mp4"
-    chunk_dir = (
-        processing_root
-        / "result"
-        / "video123_000000_005000.mp4"
-    )
-
     class FakeRclone:
         def __init__(self, **kwargs):
             pass
@@ -239,11 +580,11 @@ def test_success_uploads_then_cleans_then_marks_done(
         return source_video
 
     def fake_chunks(*args, **kwargs):
-        chunk_dir.mkdir(parents=True)
-        return [chunk_dir]
+        events.append("chunks")
+        return ["video123_000000_005000.mp4"]
 
-    def fake_upload(*args, **kwargs):
-        events.append("upload")
+    def fake_manifest(*args, **kwargs):
+        events.append("manifest")
         return processing_root / "temp" / "video123_manifest.json"
 
     def fake_cleanup(*args, **kwargs):
@@ -269,13 +610,13 @@ def test_success_uploads_then_cleans_then_marks_done(
     )
     monkeypatch.setattr(
         batch_module,
-        "_prepare_and_process_chunks",
+        "_prepare_process_upload_chunks",
         fake_chunks,
     )
     monkeypatch.setattr(
         batch_module,
-        "_upload_video_results",
-        fake_upload,
+        "_upload_video_manifest",
+        fake_manifest,
     )
     monkeypatch.setattr(
         batch_module,
@@ -298,12 +639,12 @@ def test_success_uploads_then_cleans_then_marks_done(
         overlap_frames=1000,
         min_tail_frames=None,
         pipeline="roomtour_dav3",
-        depth_options=object(),
-        map_options=object(),
+        depth_options=DenseDepthOptions.from_preset("preview"),
+        map_options=MapOptions(),
         stale_lock_hours=1.0,
     )
 
-    assert events == ["upload", "cleanup", "mark"]
+    assert events == ["chunks", "manifest", "cleanup", "mark"]
     assert summary["success"] == 1
     assert (processing_root / "log" / "video123.log").is_file()
 
