@@ -341,7 +341,16 @@ def chunked_run_command(
     show_default=True,
     help="Maximum claims for this process; 0 scans the complete URL list.",
 )
-@click.option("--stale-lock-hours", type=click.FloatRange(min=0.1), default=6.0, show_default=True)
+@click.option(
+    "--stale-lock-hours",
+    type=click.FloatRange(min=0.1),
+    default=0.1,
+    show_default=True,
+    help=(
+        "Recovery timeout only for directory locks left by older versions; "
+        "current flock leases release automatically when a process exits."
+    ),
+)
 @click.option("--worker-id", default=None, help="Optional stable name written to shared state.")
 @click.option("--rclone-bin", default="rclone", show_default=True)
 @click.option("--rclone-transfers", type=click.IntRange(min=1), default=16, show_default=True)
